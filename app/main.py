@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -16,7 +17,7 @@ import anthropic
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from urllib.parse import urlencode
@@ -35,6 +36,12 @@ log = logging.getLogger("app")
 STATIC = Path(__file__).resolve().parent.parent / "static"
 IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 TZ = ZoneInfo(config.TIMEZONE)
+
+# Cloudflare and phones cache .js and .css for hours regardless of our headers. Every asset
+# address therefore carries a hash of the static folder, so a deploy changes the address and
+# nobody can end up with a new page running an old script.
+VERSION = hashlib.sha1(b"".join(f.read_bytes() for f in sorted(STATIC.iterdir()) if f.is_file())).hexdigest()[:10]
+INDEX_HTML = re.sub(r'(/static/[\w.-]+)"', rf'\1?v={VERSION}"', (STATIC / "index.html").read_text())
 
 
 class State:
@@ -429,16 +436,19 @@ async def usage(user: User = Depends(current_user)):
     return S.db.usage_summary()
 
 
-class Revalidated(StaticFiles):
+class Versioned(StaticFiles):
+    """Addresses with ?v= never change content, so they may be cached forever; others not at all."""
+
     async def get_response(self, path, scope):
         response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = "no-cache"
+        versioned = b"v=" in scope.get("query_string", b"")
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if versioned else "no-store"
         return response
 
 
 @app.get("/")
 async def index(user: User = Depends(current_user)):
-    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-store"})
 
 
-app.mount("/static", Revalidated(directory=STATIC), name="static")
+app.mount("/static", Versioned(directory=STATIC), name="static")

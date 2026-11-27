@@ -1,4 +1,6 @@
 "use strict";
+// "?v=..." of this script, reused for files it loads itself so they are never stale either.
+const VERSION = document.currentScript ? new URL(document.currentScript.src).search : "";
 const $ = (id) => document.getElementById(id);
 const thread = $("thread"), input = $("input"), activity = $("activity");
 
@@ -468,7 +470,7 @@ async function startListening() {
     const mute = voice.ctx.createGain();
     mute.gain.value = 0;
     try {
-      await voice.ctx.audioWorklet.addModule("/static/tap-worklet.js");
+      await voice.ctx.audioWorklet.addModule("/static/tap-worklet.js" + VERSION);
       voice.node = new AudioWorkletNode(voice.ctx, "tap");
       voice.node.port.onmessage = (e) => onAudio(e.data);
     } catch (err) {
