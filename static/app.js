@@ -470,7 +470,8 @@ function renderPreviews() {
 // -------------------------------------------------------------------- voice
 //
 // Listening happens inside the message box: words appear as they are recognised, a small
-// meter shows the microphone level, and ✓ sends while ✕ throws the recording away.
+// meter shows the microphone level, ✓ keeps the words in the box (ready to send) and ✕
+// throws the recording away.
 // The microphone is opened when the mic button is tapped and fully released (tracks
 // stopped, audio context closed) the moment listening ends, whatever the reason.
 //
@@ -704,7 +705,8 @@ function cancelListening() {
   setListening(false);
 }
 
-// send=true: ✓ was tapped. send=false: stopped by itself; leave the words in the box.
+// ✓ and a long silence both end here with send=false: the words stay in the box to be
+// checked, fixed if needed, and sent with the send button.
 async function finishListening(send) {
   if (!voice.active || voice.finishing) return;
   if (!voice.ready && !voice.recognition) return cancelListening();
@@ -756,7 +758,8 @@ function deliver(text, send) {
   autosize();
   setListening(false);
   if (!text.trim()) { toast("I didn't catch that."); return; }
-  if (!send) { input.focus(); return; }
+  state.dictated = true;  // sending this counts as a spoken message
+  if (!send) { if (!phone.matches) input.focus(); return; }
   if (spokenOnly) heard(text); else send_(input.value);
 }
 const send_ = (text) => send(text, { voice: true });
@@ -786,6 +789,7 @@ const NO = /^(no|nope|nah|cancel|stop|wrong|don't|do not|nahi|nahin|नहीं
 
 // A spoken message with nothing typed around it. A short yes/no answers a waiting card.
 function heard(text) {
+  if (!text || state.busy) return;
   const short = text.split(/\s+/).length <= 4, card = state.pendingCard;
   if (card && short && (YES.test(text) || NO.test(text))) {
     input.value = ""; autosize(); refreshComposer();
@@ -826,11 +830,18 @@ function refreshComposer() {
   $("send").disabled = $("mic").disabled = state.busy;
 }
 
-input.addEventListener("input", () => { autosize(); refreshComposer(); });
+input.addEventListener("input", () => { autosize(); refreshComposer(); if (!input.value.trim()) state.dictated = false; });
 input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer: fine)").matches) { e.preventDefault(); send(input.value); }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer: fine)").matches) { e.preventDefault(); submit(); }
 });
-$("composer").addEventListener("submit", (e) => { e.preventDefault(); if (!voice.active) send(input.value); });
+// Dictated text goes out as a spoken message (a short "yes"/"no" answers a waiting card).
+function submit() {
+  if (voice.active || state.busy) return;
+  const spoken = state.dictated && !state.images.length;
+  state.dictated = false;
+  if (spoken) heard(input.value.trim()); else send(input.value);
+}
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(); });
 $("photo").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
 input.addEventListener("paste", (e) => {
@@ -838,7 +849,7 @@ input.addEventListener("paste", (e) => {
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
 document.addEventListener("keydown", (e) => {
-  if (voice.active && e.key === "Enter") { e.preventDefault(); finishListening(true); }
+  if (voice.active && e.key === "Enter") { e.preventDefault(); finishListening(false); }
   else if (e.key === "Escape") { if (voice.active) cancelListening(); else if (!$("lightbox").hidden) $("lightbox").hidden = true; else setMenu(false); }
 });
 
@@ -865,7 +876,7 @@ if (window.visualViewport) {
   fit();
 }
 $("mic").addEventListener("click", startListening);
-$("rec-done").addEventListener("click", () => finishListening(true));
+$("rec-done").addEventListener("click", () => { buzz(); finishListening(false); });
 $("rec-cancel").addEventListener("click", cancelListening);
 $("speak-toggle").addEventListener("click", () => {
   state.speak = !state.speak;

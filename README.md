@@ -36,6 +36,8 @@ Voice has three engines, picked by which key is set:
   server relays it to Deepgram, and words appear while the person speaks. `DEEPGRAM_LANGUAGE=multi`
   handles Hindi and English in one sentence. Product names are sent as key terms.
 - `STT_API_KEY`: any OpenAI-compatible `/audio/transcriptions` endpoint. Words appear after ✓.
+
+✓ ends listening and leaves the words in the message box; nothing is sent until the send button is tapped.
 - Neither: the phone's built-in speech recognition.
 
 The microphone is opened on tap and released as soon as listening ends, including when the page is
