@@ -121,6 +121,12 @@ def lock_for(conversation_id: str) -> asyncio.Lock:
     return S.locks.setdefault(conversation_id, asyncio.Lock())
 
 
+def is_busy(conversation_id: str) -> bool:
+    """A turn is still running for this conversation (the page uses this to catch up after a dropped connection)."""
+    lock = S.locks.get(conversation_id)
+    return bool(lock and lock.locked())
+
+
 def act_as(user: "User") -> None:
     """Changes made in this task are attributed to this person (see grocy.py)."""
     actor_email.set(user.email)
@@ -190,14 +196,16 @@ async def healthz():
 
 
 @app.get("/api/state")
-async def state(user: User = Depends(current_user)):
+async def state(request: Request, user: User = Depends(current_user)):
     conv = S.db.latest(user.email, config.IDLE_HOURS * 3600)
     return {
         "user": user.model_dump(),
+        # Only someone who came in through Cloudflare Access has a session to end.
+        "logout_url": "/cdn-cgi/access/logout" if request.headers.get("cf-access-authenticated-user-email") else "",
         "stt": "deepgram" if config.DEEPGRAM_API_KEY else "server" if config.STT_API_KEY else "browser",
         "grocy_url": config.GROCY_PUBLIC_URL,
         "history": S.db.history(user.email),
-        "conversation": {"id": conv.id, "items": S.db.shown(conv.id)} if conv else None,
+        "conversation": {"id": conv.id, "items": S.db.shown(conv.id), "busy": is_busy(conv.id)} if conv else None,
     }
 
 
@@ -211,7 +219,7 @@ async def conversation(conversation_id: str, user: User = Depends(current_user))
     conv = S.db.get(conversation_id, user.email)
     if not conv:
         raise HTTPException(404, "That chat no longer exists.")
-    return {"id": conv.id, "items": S.db.shown(conv.id)}
+    return {"id": conv.id, "items": S.db.shown(conv.id), "busy": is_busy(conv.id)}
 
 
 @app.post("/api/chat")

@@ -41,6 +41,16 @@ Voice has three engines, picked by which key is set:
 The microphone is opened on tap and released as soon as listening ends, including when the page is
 hidden or the phone is locked.
 
+## The page
+
+- **A dropped connection does not lose a turn.** The server finishes a turn on its own; if the
+  stream is cut (locked phone, weak signal) the page polls `/api/conversations/{id}` until `busy`
+  is false and redraws from the server. A message that never reached the server goes back in the
+  box.
+- On phones the menu follows a sideways swipe on the chat. "Sign out" (two taps) goes to
+  Cloudflare Access's `/cdn-cgi/access/logout` and only shows for people who came in through Access.
+- The page is sized to `visualViewport` so the message box sits on top of the iOS keyboard.
+
 Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `yourteam.cloudflareaccess.com`) and `CF_ACCESS_AUD` (the
 Application Audience tag of the Access app) so every request's Access token is verified. Without
 them the app trusts the `Cf-Access-Authenticated-User-Email` header as sent.

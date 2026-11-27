@@ -14,7 +14,11 @@ const state = {
   turnText: "",         // assistant text of the current turn, for reading aloud
   voiceTurn: false,     // the current turn was started by voice
   speak: localStorage.getItem("speak") === "1",
+  atBottom: true,       // the thread is scrolled to its end, so new text should keep it there
+  history: [],
 };
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+const buzz = (ms = 8) => { try { navigator.vibrate?.(ms); } catch { /* not supported */ } };
 
 // ---------------------------------------------------------------- utilities
 
@@ -33,10 +37,16 @@ function toast(message, ms = 3200) {
   toast.timer = setTimeout(() => (t.hidden = true), ms);
 }
 
+// Follow new content only while the person is at the end; if they scrolled up to read, stay put.
 function scrollDown(force) {
-  const near = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 240;
-  if (force || near) thread.scrollTop = thread.scrollHeight;
+  if (force || state.atBottom) { thread.scrollTop = thread.scrollHeight; state.atBottom = true; }
+  $("jump").hidden = state.atBottom;
 }
+thread.addEventListener("scroll", () => {
+  state.atBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 60;
+  $("jump").hidden = state.atBottom;
+}, { passive: true });
+$("jump").addEventListener("click", () => { thread.scrollTo({ top: thread.scrollHeight, behavior: "smooth" }); });
 
 function setActivity(label) {
   activity.hidden = !label;
@@ -80,6 +90,7 @@ function hideWelcome() { $("welcome").hidden = true; }
 
 function showUser(item) {
   hideWelcome();
+  const nodes = [];
   if (item.images && item.images.length) {
     const row = el("div", "photos");
     for (const src of item.images) {
@@ -89,6 +100,7 @@ function showUser(item) {
       row.append(img);
     }
     thread.append(row);
+    nodes.push(row);
   }
   if (item.text) {
     const bubble = el("div", "msg user");
@@ -99,8 +111,10 @@ function showUser(item) {
     }
     bubble.append(document.createTextNode(item.text));
     thread.append(bubble);
+    nodes.push(bubble);
   }
   scrollDown(true);
+  return nodes;
 }
 
 function showAssistant(text) {
@@ -111,10 +125,21 @@ function showAssistant(text) {
   return bubble;
 }
 
-function showError(message) {
-  thread.append(el("div", "msg error", message));
+// action: optional {label, run} button under the message.
+function showError(message, action) {
+  const box = el("div", "msg error", message);
+  if (action) {
+    const b = el("button", "btn link", action.label);
+    b.type = "button";
+    b.addEventListener("click", () => { box.remove(); action.run(); });
+    box.append(b);
+  }
+  thread.append(box);
   scrollDown(true);
 }
+
+// Reloading signs back in if the session ran out, and picks up where the chat was.
+const RELOAD = { label: "Reload page", run: () => { sessionStorage.setItem("draft", input.value); location.reload(); } };
 
 const BADGE = { add: "+", new: "+", remove: "−", open: "○", edit: "✎", list: "✓", undo: "↺" };
 
@@ -259,24 +284,76 @@ function onEvent(e) {
     showItem(e.item);
   } else if (e.type === "error") {
     showError(e.message);
+  } else if (e.type === "end") {
+    state.ended = true;
   }
 }
 
-async function run(request) {
+function renderConversation(chat) {
+  clearThread();
+  state.conversation = chat.id;
+  $("welcome").hidden = chat.items.length > 0;
+  chat.items.forEach(showItem);
+  scrollDown(true);
+}
+
+// The server finishes a turn even if the phone drops off (locked screen, tunnel, lift).
+// This waits for it and then shows the conversation as the server has it.
+async function recover() {
+  if (!state.conversation) { showError("I lost the connection. Please try again.", navigator.onLine ? RELOAD : null); return; }
+  setActivity("Catching up");
+  try {
+    for (let i = 0; i < 200; i++) {
+      const r = await fetch(`/api/conversations/${state.conversation}`);
+      if (!r.ok) throw new Error();
+      const chat = await r.json();
+      if (!chat.busy) { renderConversation(chat); return; }
+      setActivity("Still working");
+      await sleep(1500);
+    }
+  } catch {
+    showError("I lost the connection. Your last message may still have gone through.",
+      navigator.onLine ? RELOAD : { label: "Check again", run: catchUp });
+  }
+}
+
+async function catchUp() {
+  if (state.busy) return;
+  state.busy = true;
+  refreshComposer();
+  await recover();
+  state.busy = false;
+  setActivity(null);
+  refreshComposer();
+}
+
+// onFail: called when the request never reached the server, to put things back.
+async function run(request, onFail) {
   state.busy = true;
   state.turnText = "";
+  state.ended = false;
   setActivity("Thinking");
+  refreshComposer();
   document.querySelectorAll(".ask").forEach((n) => n.remove());
+  let reached = false;
   try {
     const response = await request();
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      showError(body.detail || "Something went wrong. Please try again.");
-    } else {
+    reached = true;
+    if (response.ok) {
       await readEvents(response);
+      if (!state.ended) await recover();
+    } else {
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 409 || !onFail) await recover(); else onFail();
+      if (response.status !== 409) showError(body.detail || "Something went wrong. Please try again.");
     }
   } catch (err) {
-    showError("I lost the connection. Please check your internet and try again.");
+    if (!reached && onFail) {
+      onFail();
+      showError("That didn't send, so I put it back in the box. Please try again.", navigator.onLine ? RELOAD : null);
+    } else {
+      await recover();
+    }
   } finally {
     state.busy = false;
     state.liveBubble = null;
@@ -297,17 +374,24 @@ function send(text, opts = {}) {
   autosize();
   if (state.pendingCard) { state.pendingCard.className = "card cancelled"; state.pendingCard.querySelector(".card-foot")?.remove(); state.pendingCard = null; }
   state.voiceTurn = !!opts.voice;
-  showUser({ text, images: images.map((i) => i.url), voice: opts.voice });
+  const nodes = showUser({ text, images: images.map((i) => i.url), voice: opts.voice });
   const form = new FormData();
   form.append("text", text);
   form.append("voice", opts.voice ? "true" : "false");
   form.append("conversation_id", state.conversation || "");
   images.forEach((img, i) => form.append("images", img.blob, `photo${i}.jpg`));
-  run(() => fetch("/api/chat", { method: "POST", body: form }));
+  run(() => fetch("/api/chat", { method: "POST", body: form }), () => {
+    nodes.forEach((n) => n.remove());
+    input.value = text;
+    state.images = images;
+    renderPreviews();
+    autosize();
+  });
 }
 
 function confirmCard(card, approved) {
   if (state.busy) return;
+  buzz();
   card.querySelectorAll("button, input").forEach((n) => (n.disabled = true));
   state.pendingCard = null;
   run(() => fetch("/api/confirm", {
@@ -407,19 +491,26 @@ function joinText(a, b) {
 
 function setListening(on, hint) {
   voice.active = on;
+  const live = $("live");
   $("composer").classList.toggle("listening", on);
-  input.readOnly = on;
-  input.placeholder = on ? hint || "Listening…" : "What did you buy or use?";
+  $("composer").classList.remove("finishing");
+  live.hidden = !on;
+  input.hidden = on;
+  live.dataset.hint = hint || "Listening…";
   $("wave").hidden = !on || voice.engine === "browser";
   $("rec-cancel").hidden = $("rec-done").hidden = !on;
   $("photo").hidden = on;
+  if (on) showWords(); else live.replaceChildren();
   refreshComposer();
 }
 
+// Settled words in normal ink, words still being worked out in grey.
 function showWords() {
-  input.value = joinText(voice.base, joinText(voice.finalText, voice.interim));
-  autosize();
-  input.scrollTop = input.scrollHeight;
+  const live = $("live"), settled = joinText(voice.base, voice.finalText);
+  live.replaceChildren();
+  if (settled) live.append(el("span", null, settled + " "));
+  if (voice.interim) live.append(el("span", "interim", voice.interim));
+  live.scrollTop = live.scrollHeight;
 }
 
 // Tell the server when voice fails on a device, so it shows up in the logs.
@@ -435,7 +526,8 @@ async function startListening() {
   window.speechSynthesis?.cancel();
   Object.assign(voice, {
     engine: state.stt, finishing: false, ready: false, base: input.value, finalText: "", interim: "",
-    heard: false, gotAudio: false, started: performance.now(), lastSound: performance.now(), levels: new Array(24).fill(0), chunks: [], level: 0,
+    heard: false, gotAudio: false, started: performance.now(), lastSound: performance.now(),
+    levels: new Array(24).fill(0), chunks: [], level: 0, queue: [], ws: null,
   });
   if (voice.engine === "browser") return startBrowserRecognition();
 
@@ -449,9 +541,15 @@ async function startListening() {
     toast("Talking isn't available in this browser.");
     return;
   }
+  input.blur();
   setListening(true, "Starting…");
+  const ctx = voice.ctx;
   const attempt = (voice.attempt = (voice.attempt || 0) + 1);
   const stale = () => !voice.active || voice.attempt !== attempt;
+  // Loaded while the microphone is being opened, so listening starts sooner.
+  const worklet = ctx.audioWorklet
+    ? ctx.audioWorklet.addModule("/static/tap-worklet.js" + VERSION).then(() => true, (err) => { reportVoice("worklet-fallback", err); return false; })
+    : Promise.resolve(false);
 
   try {
     voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
@@ -464,52 +562,37 @@ async function startListening() {
   }
   if (stale()) { voice.stream.getTracks().forEach((t) => t.stop()); return; }
 
+  // The connection opens while audio is being set up. Anything said before it is ready
+  // waits in voice.queue, so the first words are not lost.
+  if (voice.engine === "deepgram") openSocket();
+
   try {
-    await within(voice.ctx.resume(), 1500);
-    voice.source = voice.ctx.createMediaStreamSource(voice.stream);
-    const mute = voice.ctx.createGain();
+    await within(ctx.resume(), 1500);
+    const useWorklet = await worklet;
+    if (stale()) return;
+    voice.source = ctx.createMediaStreamSource(voice.stream);
+    const mute = ctx.createGain();
     mute.gain.value = 0;
-    try {
-      await voice.ctx.audioWorklet.addModule("/static/tap-worklet.js" + VERSION);
-      voice.node = new AudioWorkletNode(voice.ctx, "tap");
+    if (useWorklet) {
+      voice.node = new AudioWorkletNode(ctx, "tap");
       voice.node.port.onmessage = (e) => onAudio(e.data);
-    } catch (err) {
+    } else {
       // Older browsers: the deprecated but universal way of reading microphone audio.
-      reportVoice("worklet-fallback", err);
-      voice.node = voice.ctx.createScriptProcessor(2048, 1, 1);
+      voice.node = ctx.createScriptProcessor(2048, 1, 1);
       voice.node.onaudioprocess = (e) => onAudio(new Float32Array(e.inputBuffer.getChannelData(0)));
     }
     voice.source.connect(voice.node);
     voice.node.connect(mute);
-    mute.connect(voice.ctx.destination);
+    mute.connect(ctx.destination);
   } catch (err) {
+    if (stale()) return;
     reportVoice("audio-setup", err);
     cancelListening();
     toast("Talking isn't working on this device right now.");
     return;
   }
-  if (stale()) return;
 
-  if (voice.engine === "deepgram") {
-    const ws = (voice.ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/listen`));
-    ws.binaryType = "arraybuffer";
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.error) { cancelListening(); toast(data.error); return; }
-      if (data.final) { voice.finalText = joinText(voice.finalText, data.text); voice.interim = ""; }
-      else voice.interim = data.text;
-      voice.heard = true;
-      if (voice.active) showWords();
-    };
-    ws.onerror = () => reportVoice("websocket", "connection error");
-    ws.onclose = () => {
-      voice.wsClosed = true;
-      voice.onWsClose?.();
-      // Dropped while still listening: keep what was heard instead of pretending to listen.
-      if (voice.active && !voice.finishing && voice.ws === ws) finishListening(false);
-    };
-    voice.wsClosed = false;
-  } else {
+  if (voice.engine !== "deepgram") {
     const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
     voice.recorder = new MediaRecorder(voice.stream, type ? { mimeType: type } : undefined);
     voice.recorder.ondataavailable = (e) => e.data.size && voice.chunks.push(e.data);
@@ -517,8 +600,36 @@ async function startListening() {
   }
   voice.ready = true;
   voice.started = voice.lastSound = performance.now();
-  input.placeholder = "Listening…";
+  $("live").dataset.hint = "Listening…";
+  buzz();
   drawMeter();
+}
+
+function openSocket() {
+  const ws = (voice.ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/listen`));
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    for (const chunk of voice.queue) ws.send(chunk);
+    voice.queue = [];
+    voice.onWsOpen?.();
+  };
+  ws.onmessage = (e) => {
+    if (voice.ws !== ws) return;
+    const data = JSON.parse(e.data);
+    if (data.error) { cancelListening(); toast(data.error); return; }
+    if (data.final) { voice.finalText = joinText(voice.finalText, data.text); voice.interim = ""; }
+    else voice.interim = data.text;
+    voice.heard = true;
+    if (voice.active) showWords();
+  };
+  ws.onerror = () => reportVoice("websocket", "connection error");
+  ws.onclose = () => {
+    if (voice.ws !== ws) return;
+    voice.onWsOpen?.();
+    voice.onWsClose?.();
+    // Dropped while still listening: keep what was heard instead of pretending to listen.
+    if (voice.active && !voice.finishing) finishListening(false);
+  };
 }
 
 // Called with ~40 ms of microphone audio at a time.
@@ -531,7 +642,7 @@ function onAudio(samples) {
   if (rms > 0.02) { voice.lastSound = now; if (voice.engine !== "deepgram" && now - voice.started > 250) voice.heard = true; }
   voice.level = Math.max(rms, (voice.level || 0) * 0.6);
   const ws = voice.ws;
-  if (!ws || ws.readyState !== WebSocket.OPEN || voice.finishing) return;
+  if (!ws || ws.readyState > WebSocket.OPEN || voice.finishing) return;
   // Deepgram gets 16 kHz 16-bit mono, whatever rate the phone records at.
   const ratio = voice.ctx.sampleRate / 16000;
   const out = new Int16Array(Math.floor(samples.length / ratio));
@@ -541,7 +652,8 @@ function onAudio(samples) {
     for (let j = from; j < to; j++) total += samples[j];
     out[i] = Math.max(-1, Math.min(1, total / (to - from))) * 0x7fff;
   }
-  ws.send(out.buffer);
+  if (ws.readyState === WebSocket.OPEN) ws.send(out.buffer);
+  else if (voice.queue.length < 400) voice.queue.push(out.buffer);  // still connecting
 }
 
 function drawMeter() {
@@ -585,11 +697,10 @@ function cancelListening() {
   if (voice.recognition) { voice.cancelled = true; voice.recognition.abort(); }
   if (voice.recorder && voice.recorder.state !== "inactive") { voice.recorder.onstop = null; voice.recorder.stop(); }
   voice.recorder = null;
-  voice.ws?.close();
+  const ws = voice.ws;
   voice.ws = null;
+  ws?.close();
   releaseMic();
-  input.value = voice.base;
-  autosize();
   setListening(false);
 }
 
@@ -598,17 +709,20 @@ async function finishListening(send) {
   if (!voice.active || voice.finishing) return;
   if (!voice.ready && !voice.recognition) return cancelListening();
   voice.finishing = true;
+  $("composer").classList.add("finishing");
+  if (send) buzz();
   if (voice.recognition) { voice.sendAfter = send; voice.recognition.stop(); return; }
   let text = "";
   if (voice.engine === "deepgram") {
     releaseMic();
     const ws = voice.ws;
+    if (ws && ws.readyState === WebSocket.CONNECTING) await new Promise((done) => { voice.onWsOpen = done; setTimeout(done, 2000); });
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send("stop");  // the last words arrive, then the server closes the socket
-      await new Promise((done) => { voice.onWsClose = done; setTimeout(done, 2500); });
+      await new Promise((done) => { voice.onWsClose = done; setTimeout(done, 2000); });
     }
+    voice.ws = null; voice.onWsClose = voice.onWsOpen = null;
     ws?.close();
-    voice.ws = null; voice.onWsClose = null;
     text = joinText(voice.finalText, voice.interim);
   } else {
     const recorder = voice.recorder;
@@ -619,7 +733,8 @@ async function finishListening(send) {
     voice.recorder = null;
     releaseMic();
     if (voice.heard) {
-      input.placeholder = "Writing down what you said…";
+      $("live").replaceChildren();
+      $("live").dataset.hint = "Writing down what you said…";
       try {
         const form = new FormData();
         form.append("audio", blob, blob.type.includes("mp4") ? "speech.m4a" : "speech.webm");
@@ -708,7 +823,7 @@ function refreshComposer() {
   const talk = canTalk();
   $("send").hidden = voice.active || (!hasContent && talk);
   $("mic").hidden = voice.active || !!hasContent || !talk;
-  $("send").disabled = state.busy;
+  $("send").disabled = $("mic").disabled = state.busy;
 }
 
 input.addEventListener("input", () => { autosize(); refreshComposer(); });
@@ -718,6 +833,37 @@ input.addEventListener("keydown", (e) => {
 $("composer").addEventListener("submit", (e) => { e.preventDefault(); if (!voice.active) send(input.value); });
 $("photo").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+document.addEventListener("keydown", (e) => {
+  if (voice.active && e.key === "Enter") { e.preventDefault(); finishListening(true); }
+  else if (e.key === "Escape") { if (voice.active) cancelListening(); else if (!$("lightbox").hidden) $("lightbox").hidden = true; else setMenu(false); }
+});
+
+// Tap a photo to see it large; tap again to close.
+thread.addEventListener("click", (e) => {
+  const img = e.target.closest(".photos img");
+  if (!img) return;
+  $("lightbox").firstElementChild.src = img.src;
+  $("lightbox").hidden = false;
+});
+$("lightbox").addEventListener("click", () => ($("lightbox").hidden = true));
+
+// iOS slides the whole page up when the keyboard opens instead of resizing it. Sizing the
+// page to the visible area keeps the message box sitting right on top of the keyboard.
+if (window.visualViewport) {
+  const fit = () => {
+    if (visualViewport.scale > 1.01) return;  // pinch-zoomed: leave the layout alone
+    document.documentElement.style.setProperty("--app-h", visualViewport.height + "px");
+    window.scrollTo(0, 0);
+    scrollDown();
+  };
+  visualViewport.addEventListener("resize", fit);
+  visualViewport.addEventListener("scroll", fit);
+  fit();
+}
 $("mic").addEventListener("click", startListening);
 $("rec-done").addEventListener("click", () => finishListening(true));
 $("rec-cancel").addEventListener("click", cancelListening);
@@ -731,25 +877,97 @@ $("speak-toggle").addEventListener("click", () => {
 });
 // ------------------------------------------------------- menu and history
 
+const phone = matchMedia("(max-width: 860px)"), sidebar = $("sidebar"), scrim = $("scrim");
+
 function setMenu(open) {
+  if (open) { input.blur(); refreshHistory(); }
   document.body.classList.toggle("menu-open", open);
-  $("scrim").hidden = !open;
+  sidebar.inert = phone.matches && !open;  // off-screen: keep it out of reach of keyboard and screen reader
+  if (!open) disarmSignOut();
 }
+phone.addEventListener("change", () => setMenu(false));
 $("menu").addEventListener("click", () => setMenu(true));
 $("avatar-top").addEventListener("click", () => setMenu(true));
 $("menu-close").addEventListener("click", () => setMenu(false));
-$("scrim").addEventListener("click", () => setMenu(false));
+scrim.addEventListener("click", () => setMenu(false));
+
+// Swipe right anywhere on the chat to pull the menu out; swipe left to push it back.
+// The menu follows the finger and settles open or closed depending on where it is let go.
+let drag = null;
+document.addEventListener("touchstart", (e) => {
+  drag = null;
+  if (!phone.matches || e.touches.length !== 1 || voice.active || !$("lightbox").hidden) return;
+  const open = document.body.classList.contains("menu-open");
+  if (!open && e.target.closest("#composer, #previews")) return;
+  const t = e.touches[0];
+  drag = { x: t.clientX, y: t.clientY, open, width: sidebar.offsetWidth, moving: false, lastX: t.clientX, lastT: e.timeStamp, speed: 0 };
+}, { passive: true });
+document.addEventListener("touchmove", (e) => {
+  if (!drag) return;
+  const t = e.touches[0], dx = t.clientX - drag.x, dy = t.clientY - drag.y;
+  if (!drag.moving) {
+    if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
+    // Only a clearly sideways drag in the useful direction counts; anything else is scrolling.
+    if (Math.abs(dx) < Math.abs(dy) * 1.5 || (drag.open ? dx > 0 : dx < 0)) { drag = null; return; }
+    drag.moving = true;
+    drag.x = t.clientX;
+    document.body.classList.add("dragging");
+    return;
+  }
+  if (e.cancelable) e.preventDefault();
+  const offset = Math.max(-drag.width, Math.min(0, drag.open ? dx : dx - drag.width));
+  drag.offset = offset;
+  drag.speed = (t.clientX - drag.lastX) / Math.max(1, e.timeStamp - drag.lastT);
+  drag.lastX = t.clientX; drag.lastT = e.timeStamp;
+  sidebar.style.transform = `translateX(${offset}px)`;
+  scrim.style.opacity = 1 + offset / drag.width;
+}, { passive: false });
+const endDrag = () => {
+  if (!drag || !drag.moving) { drag = null; return; }
+  const shown = 1 + (drag.offset ?? (drag.open ? 0 : -drag.width)) / drag.width;
+  const open = Math.abs(drag.speed) > 0.35 ? drag.speed > 0 : shown > 0.5;
+  drag = null;
+  document.body.classList.remove("dragging");
+  sidebar.style.transform = scrim.style.opacity = "";
+  setMenu(open);
+};
+document.addEventListener("touchend", endDrag);
+document.addEventListener("touchcancel", endDrag);
+
+// Signing out takes two taps, so a stray touch doesn't send anyone back to the sign-in page.
+let signOutTimer = 0;
+function disarmSignOut() {
+  clearTimeout(signOutTimer);
+  $("sign-out").classList.remove("armed");
+  $("sign-out").lastElementChild.textContent = "Sign out";
+}
+$("sign-out").addEventListener("click", () => {
+  const b = $("sign-out");
+  if (b.classList.contains("armed")) { location.href = b.dataset.url; return; }
+  b.classList.add("armed");
+  b.lastElementChild.textContent = "Tap again to sign out";
+  signOutTimer = setTimeout(disarmSignOut, 4000);
+});
 
 function clearThread() {
   state.pendingCard = null;
   [...thread.children].forEach((n) => n.id !== "welcome" && n.remove());
 }
 
+function dayLabel(seconds) {
+  const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((midnight(new Date()) - midnight(new Date(seconds * 1000))) / 864e5);
+  return days <= 0 ? "Today" : days === 1 ? "Yesterday" : days < 7 ? "Earlier this week" : "Older";
+}
+
 function renderHistory(list) {
   const nav = $("history");
   nav.replaceChildren();
   if (!list.length) nav.append(el("div", "empty", "Your chats will show up here."));
+  let group = "";
   for (const chat of list) {
+    const label = dayLabel(chat.updated_at);
+    if (label !== group) { nav.append(el("div", "side-label", label)); group = label; }
     const b = el("button", chat.id === state.conversation ? "active" : null, chat.title);
     b.type = "button";
     b.title = new Date(chat.updated_at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
@@ -773,26 +991,26 @@ async function openConversation(id) {
     const r = await fetch(`/api/conversations/${id}`);
     if (!r.ok) throw new Error();
     const chat = await r.json();
-    clearThread();
-    state.conversation = chat.id;
-    $("welcome").hidden = chat.items.length > 0;
-    chat.items.forEach(showItem);
-    scrollDown(true);
-    renderHistory(state.history || []);
+    renderConversation(chat);
+    renderHistory(state.history);
+    if (chat.busy) catchUp();
   } catch {
     toast("I couldn't open that chat.");
   }
 }
 
-$("new-chat").addEventListener("click", () => {
+function newChat() {
   if (state.busy) return;
   setMenu(false);
   state.conversation = null;
   clearThread();
   $("welcome").hidden = false;
-  renderHistory(state.history || []);
-  input.focus();
-});
+  scrollDown(true);
+  renderHistory(state.history);
+  if (!phone.matches) input.focus();
+}
+$("new-chat").addEventListener("click", newChat);
+$("new-top").addEventListener("click", newChat);
 document.querySelector(".quick").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (!b) return;
@@ -816,15 +1034,30 @@ async function boot() {
     $("me-name").textContent = data.user.name;
     $("me-email").textContent = data.user.email.endsWith("@local") ? "Not signed in" : data.user.email;
     if (data.grocy_url) { $("grocy-link").href = data.grocy_url; $("grocy-link").hidden = false; }
-    if (data.conversation && data.conversation.items.length) {
-      state.conversation = data.conversation.id;
-      data.conversation.items.forEach(showItem);
-      scrollDown(true);
-    }
+    if (data.logout_url) { $("sign-out").dataset.url = data.logout_url; $("sign-out").hidden = false; }
+    if (data.conversation && data.conversation.items.length) renderConversation(data.conversation);
     renderHistory(data.history || []);
+    if (data.conversation && data.conversation.busy) catchUp();
   } catch {
-    showError("I couldn't load. Please refresh the page.");
+    showError("I couldn't load.", RELOAD);
   }
+  const draft = sessionStorage.getItem("draft");
+  if (draft) { input.value = draft; sessionStorage.removeItem("draft"); autosize(); }
+  setMenu(false);
   refreshComposer();
+  if (!phone.matches) input.focus();
 }
 boot();
+
+// Coming back to the page: show what the server has now. After a long time away, start fresh.
+let hiddenAt = 0;
+document.addEventListener("visibilitychange", async () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  if (state.busy || away < 5 * 60e3) return;
+  if (away > 6 * 3600e3 && !input.value.trim() && !state.images.length) { location.reload(); return; }
+  refreshHistory();
+  if (state.conversation) catchUp();
+});
+window.addEventListener("online", () => { if (state.conversation && thread.querySelector(".msg.error")) { thread.querySelectorAll(".msg.error").forEach((n) => n.remove()); catchUp(); } });
+window.addEventListener("offline", () => toast("You're offline. I'll be here when the internet is back.", 5000));
