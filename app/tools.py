@@ -54,8 +54,59 @@ NEW_PRODUCT = obj(
         "product_group_id": INT,
         "default_best_before_days": d(INT, "Typical shelf life in days; -1 if it never expires."),
         "min_stock_amount": d(NUM, "Below this amount Grocy treats it as missing. Default 0."),
+        "default_best_before_days_after_open": d(INT, "Shelf life in days once opened."),
+        "store_id": d(INT, "Store it is usually bought at."),
+        "description": STR,
+        "parent_product_id": d(INT, "Generic parent product this is a variant of."),
     },
     ["name", "location_id", "qu_id"],
+)
+
+
+# kind -> (Grocy entity, word shown to the user)
+MASTER = {
+    "location": ("locations", "location"),
+    "quantity_unit": ("quantity_units", "unit"),
+    "store": ("shopping_locations", "store"),
+    "product_group": ("product_groups", "product group"),
+    "shopping_list": ("shopping_lists", "shopping list"),
+    "meal_plan_section": ("meal_plan_sections", "meal plan section"),
+    "task_category": ("task_categories", "task category"),
+    "battery": ("batteries", "battery"),
+    "equipment": ("equipment", "equipment"),
+}
+MASTER_FIELDS = {
+    "name": STR,
+    "name_plural": d(STR, "Quantity units only."),
+    "is_freezer": d(BOOL, "Locations only."),
+    "description": d(STR, "Not for meal plan sections."),
+    "charge_interval_days": d(INT, "Batteries only: remind to charge every N days."),
+}
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+CHORE_FIELDS = {
+    "name": STR,
+    "description": STR,
+    "schedule": {"type": "string", "enum": ["manually", "daily", "weekly", "monthly", "yearly"],
+                 "description": "manually = no schedule. daily/weekly/monthly/yearly repeat every `every` days/weeks/months/years."},
+    "every": d(INT, "Repeat interval, default 1 (e.g. schedule=daily, every=3 is every 3 days)."),
+    "weekdays": {"type": "array", "items": {"type": "string", "enum": WEEKDAYS}, "description": "Weekly schedules: which days."},
+    "day_of_month": d(INT, "Monthly schedules: 1-31."),
+    "start_date": DATE,
+    "assignment": {"type": "string", "enum": ["no-assignment", "who-least-did-first", "random", "in-alphabetical-order"]},
+    "assigned_user_ids": {"type": "array", "items": INT, "description": "People who take turns (ids from get_master_data users)."},
+}
+INGREDIENTS = arr(
+    obj(
+        {
+            "product_id": INT,
+            "amount": d(NUM, "In the product's stock unit."),
+            "note": STR,
+            "variable_amount": d(STR, "Free text shown instead of the amount, e.g. 'a pinch'."),
+            "only_check_any_in_stock": d(BOOL, "True for staples like salt or oil: any amount in stock counts as enough."),
+            "group": d(STR, "Optional heading, e.g. 'For the sauce'."),
+        },
+        ["product_id", "amount"],
+    )
 )
 
 
@@ -75,7 +126,7 @@ class Tool:
 TOOLS: list[Tool] = [
     Tool(
         "search_products",
-        "Fuzzy-search products by name. Returns the closest matches with current stock. "
+        "Fuzzy-search products by name, or look one up by its barcode digits. Returns the closest matches with current stock. "
         "The catalog in the system prompt is usually enough; use this when it may be stale or truncated.",
         obj({"query": STR}, ["query"]),
         "Looking up products",
@@ -91,7 +142,8 @@ TOOLS: list[Tool] = [
     Tool(
         "get_product_details",
         "Master data of one product: units, unit conversions, default location, shelf life, minimum "
-        "stock, barcodes, last and average price. Use before converting between units.",
+        "stock, barcodes, parent product, last and average price and recent price history. Use before "
+        "converting between units.",
         obj({"product_id": INT}, ["product_id"]),
         "Checking product details",
     ),
@@ -110,14 +162,16 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "get_shopping_list",
-        "Items on a shopping list with their item ids, amounts, notes and done state.",
-        obj({"list_id": d(INT, "Default 1.")}),
+        "Items on the shopping lists with their item ids, amounts, notes and done state.",
+        obj({"list_id": d(INT, "Omit to read every list.")}),
         "Reading the shopping list",
     ),
     Tool(
         "get_master_data",
-        "Fresh list of locations, quantity units, stores, product groups or shopping lists.",
-        obj({"kind": {"type": "string", "enum": ["locations", "quantity_units", "stores", "product_groups", "shopping_lists"]}}, ["kind"]),
+        "Fresh list of locations, quantity units, stores, product groups, shopping lists, meal plan "
+        "sections (breakfast, dinner...), task categories, household members (users), batteries or equipment.",
+        obj({"kind": {"type": "string", "enum": ["locations", "quantity_units", "stores", "product_groups", "shopping_lists",
+                                                 "meal_plan_sections", "task_categories", "users", "batteries", "equipment"]}}, ["kind"]),
         "Checking Grocy settings",
     ),
     Tool(
@@ -173,6 +227,7 @@ TOOLS: list[Tool] = [
                             "all": BOOL,
                             "spoiled": BOOL,
                             "location_id": d(INT, "Only take from this location."),
+                            "entry_id": d(INT, "Only take from this stock entry (ids from get_stock with product_id)."),
                         },
                         ["product_id"],
                     )
@@ -266,15 +321,16 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "update_shopping_list_item",
-        "Change the amount or note of a shopping list item, or tick it off / untick it. Runs immediately.",
-        obj({"item_id": INT, "amount": NUM, "note": STR, "done": BOOL}, ["item_id"]),
+        "Change the amount or note of a shopping list item, tick it off / untick it, or move it to another list. Runs immediately.",
+        obj({"item_id": INT, "amount": NUM, "note": STR, "done": BOOL, "list_id": d(INT, "Move the item to this list.")}, ["item_id"]),
         "Updating the shopping list",
         "auto",
     ),
     Tool(
         "add_low_stock_to_shopping_list",
-        "Put every product that is below its minimum stock on the shopping list. Runs immediately.",
-        obj({"list_id": d(INT, "Default 1.")}),
+        "Put every product that is below its minimum stock on the shopping list, optionally also the "
+        "overdue and expired ones (to replace them). Runs immediately.",
+        obj({"list_id": d(INT, "Default 1."), "also_overdue": BOOL, "also_expired": BOOL}),
         "Updating the shopping list",
         "auto",
     ),
@@ -305,7 +361,17 @@ TOOLS: list[Tool] = [
                 "min_stock_amount": NUM,
                 "default_best_before_days": INT,
                 "default_best_before_days_after_open": INT,
+                "default_best_before_days_after_freezing": INT,
+                "default_best_before_days_after_thawing": INT,
                 "store_id": d(INT, "Default store."),
+                "due_type": {"type": "string", "enum": ["best_before", "expiration"], "description": "best_before: still usable after the date. expiration: unsafe after the date."},
+                "parent_product_id": d(INT, "Make this a variant of a generic parent product; 0 removes the parent."),
+                "active": d(BOOL, "false hides a product that is no longer used (it is not deleted)."),
+                "quick_consume_amount": d(NUM, "Amount Grocy's one-tap consume button takes."),
+                "calories": d(NUM, "Per stock unit."),
+                "treat_opened_as_out_of_stock": BOOL,
+                "should_not_be_frozen": BOOL,
+                "hide_on_stock_overview": BOOL,
             },
             ["product_id"],
         ),
@@ -314,22 +380,39 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "create_master_item",
-        "Create a location, quantity unit, store or product group. The user confirms.",
-        obj(
-            {
-                "kind": {"type": "string", "enum": ["location", "quantity_unit", "store", "product_group"]},
-                "name": STR,
-                "name_plural": d(STR, "Quantity units only."),
-                "is_freezer": d(BOOL, "Locations only."),
-            },
-            ["kind", "name"],
-        ),
+        "Create a location, quantity unit, store, product group, shopping list, meal plan section, "
+        "task category, battery or piece of equipment. The user confirms.",
+        obj({"kind": {"type": "string", "enum": list(MASTER)}, **MASTER_FIELDS}, ["kind", "name"]),
         "Preparing new entry",
         "gated",
     ),
     Tool(
+        "update_master_item",
+        "Rename or edit a location, quantity unit, store, product group, shopping list, meal plan "
+        "section, task category, battery or piece of equipment. Only the given fields change. The user confirms.",
+        obj({"kind": {"type": "string", "enum": list(MASTER)}, "id": INT, **MASTER_FIELDS}, ["kind", "id"]),
+        "Preparing change",
+        "gated",
+    ),
+    Tool(
+        "add_product_barcode",
+        "Attach a barcode to a product so it can be found by scanning. The user confirms.",
+        obj({"product_id": INT, "barcode": STR, "amount": d(NUM, "How many stock units one scan of this pack means."), "store_id": INT, "note": STR}, ["product_id", "barcode"]),
+        "Preparing barcode",
+        "gated",
+    ),
+    Tool(
+        "add_unit_conversion",
+        "Teach Grocy that 1 of one unit equals `factor` of another (e.g. 1 pack = 12 pieces). With "
+        "product_id it applies to that product only, otherwise everywhere. The user confirms.",
+        obj({"from_unit_id": INT, "to_unit_id": INT, "factor": NUM, "product_id": INT}, ["from_unit_id", "to_unit_id", "factor"]),
+        "Preparing unit conversion",
+        "gated",
+    ),
+    Tool(
         "get_recipes",
-        "Recipes saved in Grocy with whether current stock covers them. With recipe_id: the ingredients and instructions.",
+        "Recipes saved in Grocy with whether current stock covers them. With recipe_id: the ingredients "
+        "(and how much of each is missing) and instructions.",
         obj({"recipe_id": INT}),
         "Looking at recipes",
         feature="FEATURE_FLAG_RECIPES",
@@ -337,7 +420,7 @@ TOOLS: list[Tool] = [
     Tool(
         "consume_recipe",
         "Take all ingredients of a saved recipe out of stock (it was cooked). The user confirms.",
-        obj({"recipe_id": INT}, ["recipe_id"]),
+        obj({"recipe_id": INT, "servings": d(NUM, "How many servings were cooked. Default: the recipe's own.")}, ["recipe_id"]),
         "Preparing stock update",
         "gated",
         "FEATURE_FLAG_RECIPES",
@@ -358,7 +441,7 @@ TOOLS: list[Tool] = [
                 "name": STR,
                 "instructions": d(STR, "Plain text, one step per line."),
                 "servings": d(INT, "Default 1."),
-                "ingredients": arr(obj({"product_id": INT, "amount": NUM, "note": STR}, ["product_id", "amount"])),
+                "ingredients": INGREDIENTS,
             },
             ["name", "ingredients"],
         ),
@@ -367,8 +450,28 @@ TOOLS: list[Tool] = [
         "FEATURE_FLAG_RECIPES",
     ),
     Tool(
+        "update_recipe",
+        "Edit a saved recipe: rename it, change the instructions or servings, and add or change "
+        "ingredients. Each given ingredient is matched by product: one already in the recipe is "
+        "changed, a new one is added, the others stay as they are. Ingredients cannot be removed "
+        "here; that has to be done in Grocy. The user confirms.",
+        obj(
+            {
+                "recipe_id": INT,
+                "name": STR,
+                "instructions": d(STR, "Plain text, one step per line."),
+                "servings": INT,
+                "ingredients": INGREDIENTS,
+            },
+            ["recipe_id"],
+        ),
+        "Preparing recipe change",
+        "gated",
+        "FEATURE_FLAG_RECIPES",
+    ),
+    Tool(
         "get_meal_plan",
-        "Meal plan entries between two dates (default: today and the next 7 days).",
+        "Meal plan entries (with entry ids) between two dates (default: today and the next 7 days).",
         obj({"from_date": DATE, "to_date": DATE}),
         "Looking at the meal plan",
         feature="FEATURE_FLAG_RECIPES_MEALPLAN",
@@ -376,32 +479,91 @@ TOOLS: list[Tool] = [
     Tool(
         "add_meal_plan_entry",
         "Plan a meal for a day: a saved recipe, a product, or a free-text note. Runs immediately.",
-        obj({"day": DATE, "recipe_id": INT, "product_id": INT, "note": STR, "servings": d(NUM, "Default 1.")}, ["day"]),
+        obj({"day": DATE, "recipe_id": INT, "product_id": INT, "note": STR, "servings": d(NUM, "Default 1."),
+             "section_id": d(INT, "Meal plan section such as breakfast or dinner (get_master_data meal_plan_sections).")}, ["day"]),
+        "Updating the meal plan",
+        "auto",
+        "FEATURE_FLAG_RECIPES_MEALPLAN",
+    ),
+    Tool(
+        "update_meal_plan_entry",
+        "Change a meal plan entry: move it to another day or section, change servings or the note, or "
+        "mark it done. Entries cannot be removed here. Runs immediately.",
+        obj({"entry_id": INT, "day": DATE, "servings": NUM, "section_id": INT, "note": STR, "done": BOOL}, ["entry_id"]),
         "Updating the meal plan",
         "auto",
         "FEATURE_FLAG_RECIPES_MEALPLAN",
     ),
     Tool(
         "get_chores",
-        "Household chores with when each is next due.",
-        obj({}),
+        "Household chores with schedule, who is next and when each is next due. With chore_id: its "
+        "details and recent times it was done (with execution ids for undo_chore).",
+        obj({"chore_id": INT}),
         "Looking at chores",
         feature="FEATURE_FLAG_CHORES",
     ),
     Tool(
         "track_chore",
-        "Record that a chore was done just now. Runs immediately.",
-        obj({"chore_id": INT}, ["chore_id"]),
+        "Record that a chore was done (now, or on done_on), or skipped this time. Runs immediately.",
+        obj({"chore_id": INT, "done_on": d(DATE, "Omit for now."), "skipped": BOOL,
+             "done_by_user_id": d(INT, "Who did it, if not the person writing (get_master_data users).")}, ["chore_id"]),
         "Recording chore",
         "auto",
         "FEATURE_FLAG_CHORES",
     ),
-    Tool("get_tasks", "Open to-do tasks.", obj({}), "Looking at tasks", feature="FEATURE_FLAG_TASKS"),
+    Tool(
+        "undo_chore",
+        "Undo a recorded chore execution by execution id (from track_chore's result or get_chores with chore_id). Runs immediately.",
+        obj({"execution_id": INT}, ["execution_id"]),
+        "Recording chore",
+        "auto",
+        "FEATURE_FLAG_CHORES",
+    ),
+    Tool(
+        "create_chore",
+        "Set up a new recurring chore. The user confirms.",
+        obj(CHORE_FIELDS, ["name", "schedule"]),
+        "Preparing chore",
+        "gated",
+        "FEATURE_FLAG_CHORES",
+    ),
+    Tool(
+        "update_chore",
+        "Edit a chore: name, description, schedule or who does it. active=false retires it. Only the given fields change. The user confirms.",
+        obj({"chore_id": INT, **CHORE_FIELDS, "active": BOOL}, ["chore_id"]),
+        "Preparing chore change",
+        "gated",
+        "FEATURE_FLAG_CHORES",
+    ),
+    Tool(
+        "get_tasks",
+        "To-do tasks with due date, category and who they are assigned to. Open ones by default.",
+        obj({"include_done": d(BOOL, "Also list recently completed tasks.")}),
+        "Looking at tasks",
+        feature="FEATURE_FLAG_TASKS",
+    ),
     Tool(
         "add_task",
         "Add a to-do task. Runs immediately.",
-        obj({"name": STR, "due_date": DATE, "description": STR}, ["name"]),
+        obj({"name": STR, "due_date": DATE, "description": STR, "category_id": INT,
+             "assigned_to_user_id": d(INT, "From get_master_data users.")}, ["name"]),
         "Adding task",
+        "auto",
+        "FEATURE_FLAG_TASKS",
+    ),
+    Tool(
+        "update_task",
+        "Change a task's name, due date (empty string clears it), description, category or assignee. Runs immediately.",
+        obj({"task_id": INT, "name": STR, "due_date": STR, "description": STR, "category_id": INT, "assigned_to_user_id": INT}, ["task_id"]),
+        "Updating task",
+        "auto",
+        "FEATURE_FLAG_TASKS",
+    ),
+    Tool(
+        "reopen_task",
+        "Mark a completed task as not done again. Runs immediately.",
+        obj({"task_id": INT}, ["task_id"]),
+        "Updating task",
         "auto",
         "FEATURE_FLAG_TASKS",
     ),
@@ -412,6 +574,29 @@ TOOLS: list[Tool] = [
         "Completing task",
         "auto",
         "FEATURE_FLAG_TASKS",
+    ),
+    Tool(
+        "get_calendar",
+        "Everything with a date between two days (default: today and the next 14 days): products "
+        "reaching their due date, planned meals, chores, tasks and battery charges.",
+        obj({"from_date": DATE, "to_date": DATE}),
+        "Looking at the calendar",
+    ),
+    Tool(
+        "get_spending",
+        "Money spent on purchases between two dates (default: the last 30 days): total, per store, "
+        "per product group and the biggest items. Only purchases that were entered with a price count.",
+        obj({"from_date": DATE, "to_date": DATE}),
+        "Adding up spending",
+    ),
+    Tool("get_batteries", "Rechargeable batteries with last and next charge.", obj({}), "Looking at batteries", feature="FEATURE_FLAG_BATTERIES"),
+    Tool(
+        "charge_battery",
+        "Record that a battery was charged (now, or on charged_on). Runs immediately.",
+        obj({"battery_id": INT, "charged_on": DATE}, ["battery_id"]),
+        "Recording charge",
+        "auto",
+        "FEATURE_FLAG_BATTERIES",
     ),
     Tool(
         "ask_user",
@@ -425,6 +610,15 @@ TOOLS: list[Tool] = [
 ]
 
 BY_NAME = {t.name: t for t in TOOLS}
+
+
+def recipe_html(instructions: str) -> str:
+    return "".join(f"<p>{line}</p>" for line in instructions.replace("<", "&lt;").splitlines() if line.strip())
+
+
+def cap(text: str) -> str:
+    """Upper-case the first letter only (str.capitalize would lower-case names in the rest)."""
+    return text[:1].upper() + text[1:]
 
 
 def strip_html(text: str | None) -> str:
@@ -496,6 +690,25 @@ class Toolbox:
             raise ToolError(f"{field} must be greater than 0.")
         return amount
 
+    async def need_row(self, entity: str, row_id: Any, what: str) -> dict:
+        rid = to_int(row_id)
+        rows = await self.g.objects(entity, [f"id={rid}"]) if rid else []
+        if not rows:
+            raise ToolError(f"There is no {what} with id {row_id}.")
+        return rows[0]
+
+    async def users(self) -> dict[int, str]:
+        try:
+            return {int(u["id"]): u.get("display_name") or u.get("username") or f"user {u['id']}" for u in await self.g.get("/users")}
+        except GrocyError:
+            return {}
+
+    async def need_user(self, user_id: Any) -> tuple[int, str]:
+        users = await self.users()
+        if to_int(user_id) not in users:
+            raise ToolError(f"There is no user with id {user_id}. Known: {users}")
+        return to_int(user_id), users[to_int(user_id)]
+
     async def stock_amount(self, product_id: int) -> float:
         details = await self.g.get(f"/stock/products/{product_id}")
         return to_float(details.get("stock_amount"))
@@ -525,6 +738,18 @@ class Toolbox:
             if group not in self.cat.groups:
                 raise ToolError(f"There is no product group with id {group}.")
             fields["product_group_id"] = group
+        if np.get("default_best_before_days_after_open") is not None:
+            fields["default_best_before_days_after_open"] = to_int(np["default_best_before_days_after_open"]) or 0
+        if np.get("store_id"):
+            if to_int(np["store_id"]) not in self.cat.stores:
+                raise ToolError(f"There is no store with id {np['store_id']}.")
+            fields["shopping_location_id"] = to_int(np["store_id"])
+        if np.get("description"):
+            fields["description"] = str(np["description"])
+        if np.get("parent_product_id"):
+            if not self.cat.product(np["parent_product_id"]):
+                raise ToolError(f"There is no product with id {np['parent_product_id']} to use as parent.")
+            fields["parent_product_id"] = to_int(np["parent_product_id"])
         return fields
 
     def default_best_before(self, days: Any) -> str:
@@ -542,6 +767,13 @@ class Toolbox:
         if not query:
             raise ToolError("query is empty.")
         await self.cat.refresh(force=True)
+        if re.fullmatch(r"[\d\s-]{6,}", query):
+            code = re.sub(r"\D", "", query)
+            hit = await self.g.objects("product_barcodes", [f"barcode={code}"])
+            if not hit:
+                return "No product has that barcode yet. If the user says which product it is, add_product_barcode can attach it."
+            pid = to_int(hit[0]["product_id"])
+            return [{"product_id": pid, "name": self.cat.product_name(pid), "in_stock": self.cat.amount(pid, await self.stock_amount(pid))}]
         words = query.split()
         scored = []
         for p in self.cat.products.values():
@@ -614,7 +846,21 @@ class Toolbox:
         p = await self.need_product(pid)
         details = await self.g.get(f"/stock/products/{pid}")
         conversions = await self.g.objects("quantity_unit_conversions_resolved", [f"product_id={pid}"])
+        try:
+            history = await self.g.get(f"/stock/products/{pid}/price-history") or []
+        except GrocyError:
+            history = []
         return {
+            "active": to_int(p.get("active", 1)) != 0,
+            "parent_product": self.cat.product_name(p["parent_product_id"]) if p.get("parent_product_id") else None,
+            "product_group": self.cat.groups.get(to_int(p.get("product_group_id")) or -1, {}).get("name"),
+            "default_store": self.cat.stores.get(to_int(p.get("shopping_location_id")) or -1, {}).get("name"),
+            "due_type": "expiration" if to_int(p.get("due_type")) == 2 else "best_before",
+            "last_used": details.get("last_used"),
+            "price_history": [
+                {"date": str(h.get("date"))[:10], "price_per_unit": h.get("price"), "store": (h.get("shopping_location") or {}).get("name")}
+                for h in history[-6:]
+            ],
             "product_id": pid,
             "name": p["name"],
             "description": strip_html(p.get("description")),
@@ -634,6 +880,8 @@ class Toolbox:
             "last_price_per_unit": details.get("last_price"),
             "average_price_per_unit": details.get("avg_price"),
             "barcodes": [b["barcode"] for b in details.get("product_barcodes") or []],
+            "calories_per_unit": p.get("calories"),
+            "quick_consume_amount": p.get("quick_consume_amount"),
         }
 
     async def r_get_expiring(self, inp: dict) -> Any:
@@ -679,13 +927,16 @@ class Toolbox:
         ] or "No bookings yet."
 
     async def r_get_shopping_list(self, inp: dict) -> Any:
-        list_id = to_int(inp.get("list_id")) or 1
-        rows = await self.g.objects("shopping_list", [f"shopping_list_id={list_id}"])
+        list_id = to_int(inp.get("list_id"))
+        if list_id and list_id not in self.cat.lists:
+            raise ToolError(f"There is no shopping list with id {list_id}.")
+        rows = await self.g.objects("shopping_list", [f"shopping_list_id={list_id}"] if list_id else None)
         out = []
         for r in rows:
             pid = to_int(r.get("product_id"))
             out.append(
                 {
+                    "list": self.cat.lists.get(to_int(r.get("shopping_list_id")) or -1, {}).get("name"),
                     "item_id": to_int(r["id"]),
                     "product_id": pid,
                     "name": self.cat.product_name(pid) if pid else (r.get("note") or "(empty)"),
@@ -694,10 +945,18 @@ class Toolbox:
                     "done": bool(to_int(r.get("done"))),
                 }
             )
-        return out or "The shopping list is empty."
+        return out or ("That shopping list is empty." if list_id else "The shopping lists are empty.")
 
     async def r_get_master_data(self, inp: dict) -> Any:
         await self.cat.refresh(force=True)
+        kind = str(inp.get("kind"))
+        if kind == "users":
+            return [{"id": i, "name": n} for i, n in sorted((await self.users()).items())] or "No users could be read."
+        if kind in ("meal_plan_sections", "task_categories", "equipment"):
+            rows = await self.g.objects(kind, order="name")
+            return [{"id": to_int(r["id"]), "name": r["name"], **({"description": strip_html(r["description"])} if r.get("description") else {})} for r in rows if r.get("name")] or "None yet."
+        if kind == "batteries":
+            return await self.r_get_batteries({})
         source = {
             "locations": self.cat.locations,
             "quantity_units": self.cat.units,
@@ -728,15 +987,30 @@ class Toolbox:
     async def r_get_recipes(self, inp: dict) -> Any:
         rid = to_int(inp.get("recipe_id"))
         if rid:
-            recipe = await self.g.get(f"/objects/recipes/{rid}")
+            recipe = await self.recipe(rid)
             positions = await self.g.objects("recipes_pos", [f"recipe_id={rid}"])
+            try:
+                resolved = {to_int(r["product_id"]): r for r in await self.g.objects("recipes_pos_resolved", [f"recipe_id={rid}"])}
+            except GrocyError:
+                resolved = {}
+
+            def missing(p: dict) -> str | None:
+                amount = to_float(resolved.get(to_int(p["product_id"]), {}).get("missing_amount"))
+                return self.cat.amount(p["product_id"], amount) if amount > 0 else None
+
             return {
                 "recipe_id": rid,
                 "name": recipe["name"],
                 "servings": recipe.get("base_servings"),
                 "instructions": strip_html(recipe.get("description")),
                 "ingredients": [
-                    {"product_id": to_int(p["product_id"]), "name": self.cat.product_name(p["product_id"]), "amount": fmt_num(p["amount"]), "unit": self.cat.unit_name(p.get("qu_id"), p["amount"]), "note": p.get("note") or None}
+                    {k: v for k, v in {
+                        "product_id": to_int(p["product_id"]), "name": self.cat.product_name(p["product_id"]),
+                        "amount": to_float(p["amount"]), "unit": self.cat.unit_name(p.get("qu_id"), p["amount"]),
+                        "note": p.get("note") or None, "variable_amount": p.get("variable_amount") or None,
+                        "only_check_any_in_stock": bool(to_int(p.get("only_check_single_unit_in_stock"))) or None,
+                        "group": p.get("ingredient_group") or None, "missing": missing(p),
+                    }.items() if v is not None}
                     for p in positions
                 ],
             }
@@ -752,31 +1026,160 @@ class Toolbox:
             for r in recipes
         ] or "No recipes are saved in Grocy."
 
+    async def sections(self) -> dict[int, str]:
+        return {to_int(r["id"]): r["name"] for r in await self.g.objects("meal_plan_sections") if r.get("name")}
+
+    async def meal_title(self, r: dict) -> str:
+        if r.get("type") == "recipe" and r.get("recipe_id"):
+            try:
+                return (await self.g.get(f"/objects/recipes/{r['recipe_id']}"))["name"]
+            except GrocyError:
+                return "recipe"
+        if r.get("type") == "product":
+            return self.cat.product_name(r.get("product_id"))
+        return r.get("note") or "note"
+
     async def r_get_meal_plan(self, inp: dict) -> Any:
         start = parse_date(inp.get("from_date"), "from_date") or self.today().isoformat()
         end = parse_date(inp.get("to_date"), "to_date") or (self.today() + timedelta(days=7)).isoformat()
         rows = await self.g.objects("meal_plan", [f"day>={start}", f"day<={end}"], order="day")
+        sections = await self.sections()
         out = []
         for r in rows:
-            what = r.get("note") or ""
-            if r.get("type") == "recipe" and r.get("recipe_id"):
-                what = (await self.g.get(f"/objects/recipes/{r['recipe_id']}"))["name"]
-            elif r.get("type") == "product":
-                what = self.cat.product_name(r.get("product_id"))
-            out.append({"day": r["day"], "type": r.get("type"), "what": what})
+            row = {"entry_id": to_int(r["id"]), "day": r["day"], "type": r.get("type"), "what": await self.meal_title(r)}
+            if r.get("type") == "recipe":
+                row["recipe_id"], row["servings"] = to_int(r.get("recipe_id")), to_float(r.get("recipe_servings"))
+            if sections.get(to_int(r.get("section_id")) or -1):
+                row["section"] = sections[to_int(r["section_id"])]
+            if to_int(r.get("done")):
+                row["done"] = True
+            out.append(row)
         return out or "Nothing is planned in that period."
 
+    @staticmethod
+    def chore_schedule(c: dict) -> str:
+        kind, every = c.get("period_type") or "manually", to_int(c.get("period_interval")) or 1
+        if kind == "manually":
+            return "no schedule"
+        unit = {"hourly": "hour", "daily": "day", "weekly": "week", "monthly": "month", "yearly": "year"}.get(kind, kind)
+        text = f"every {unit}" if every == 1 else f"every {every} {unit}s"
+        if kind == "weekly" and c.get("period_config"):
+            text += " on " + ", ".join(str(c["period_config"]).split(","))
+        if kind == "monthly" and to_int(c.get("period_days")):
+            text += f" on day {to_int(c['period_days'])}"
+        return text
+
     async def r_get_chores(self, inp: dict) -> Any:
+        users = await self.users()
+        cid = to_int(inp.get("chore_id"))
+        if cid:
+            chore = await self.need_row("chores", cid, "chore")
+            log = await self.g.objects("chores_log", [f"chore_id={cid}"], order="id:desc", limit=10)
+            return {
+                "chore_id": cid, "name": chore["name"], "description": strip_html(chore.get("description")),
+                "schedule": self.chore_schedule(chore), "active": to_int(chore.get("active", 1)) != 0,
+                "assignment": chore.get("assignment_type"),
+                "recent": [
+                    {"execution_id": to_int(r["id"]), "when": r.get("tracked_time"), "by": users.get(to_int(r.get("done_by_user_id")) or -1),
+                     "skipped": bool(to_int(r.get("skipped"))), "undone": bool(to_int(r.get("undone")))}
+                    for r in log
+                ],
+            }
+        defs = {to_int(c["id"]): c for c in await self.g.objects("chores")}
         return [
-            {"chore_id": to_int(c["chore_id"]), "name": c["chore_name"], "next_due": c.get("next_estimated_execution_time"), "last_done": c.get("last_tracked_time")}
+            {
+                "chore_id": to_int(c["chore_id"]), "name": c["chore_name"],
+                "schedule": self.chore_schedule(defs.get(to_int(c["chore_id"]), {})),
+                "next_due": c.get("next_estimated_execution_time"), "last_done": c.get("last_tracked_time"),
+                "next_person": users.get(to_int(c.get("next_execution_assigned_to_user_id")) or -1),
+            }
             for c in await self.g.get("/chores")
         ] or "No chores are set up."
 
     async def r_get_tasks(self, inp: dict) -> Any:
+        users = await self.users()
+        categories = {to_int(c["id"]): c["name"] for c in await self.g.objects("task_categories")}
+
+        def row(t: dict) -> dict:
+            out = {"task_id": to_int(t["id"]), "name": t["name"], "due_date": t.get("due_date") or None}
+            if strip_html(t.get("description")):
+                out["description"] = strip_html(t.get("description"))
+            if categories.get(to_int(t.get("category_id")) or -1):
+                out["category"] = categories[to_int(t["category_id"])]
+            if users.get(to_int(t.get("assigned_to_user_id")) or -1):
+                out["assigned_to"] = users[to_int(t["assigned_to_user_id"])]
+            return out
+
+        open_tasks = [row(t) for t in await self.g.get("/tasks")]
+        if not inp.get("include_done"):
+            return open_tasks or "No open tasks."
+        done = await self.g.objects("tasks", ["done=1"], order="done_timestamp:desc", limit=20)
+        return {"open": open_tasks, "recently_completed": [{**row(t), "completed": t.get("done_timestamp")} for t in done]}
+
+    async def r_get_batteries(self, inp: dict) -> Any:
         return [
-            {"task_id": to_int(t["id"]), "name": t["name"], "due_date": t.get("due_date") or None}
-            for t in await self.g.get("/tasks")
-        ] or "No open tasks."
+            {"battery_id": to_int(b["battery_id"]), "name": (b.get("battery") or {}).get("name"), "used_in": (b.get("battery") or {}).get("used_in"),
+             "last_charged": b.get("last_tracked_time"), "next_charge": b.get("next_estimated_charge_time")}
+            for b in await self.g.get("/batteries")
+        ] or "No batteries are set up."
+
+    async def r_get_calendar(self, inp: dict) -> Any:
+        start = parse_date(inp.get("from_date"), "from_date") or self.today().isoformat()
+        end = parse_date(inp.get("to_date"), "to_date") or (self.today() + timedelta(days=14)).isoformat()
+
+        def inside(value: Any) -> bool:
+            return bool(value) and start <= str(value)[:10] <= end
+
+        due: dict[tuple[str, int], float] = {}
+        for e in await self.g.objects("stock", [f"best_before_date>={start}", f"best_before_date<={end}"]):
+            key = (e["best_before_date"][:10], to_int(e["product_id"]))
+            due[key] = due.get(key, 0) + to_float(e["amount"])
+        out: dict[str, Any] = {
+            "from": start, "to": end,
+            "products_due": [{"day": day, "product": self.cat.product_name(pid), "amount": self.cat.amount(pid, amount)} for (day, pid), amount in sorted(due.items())],
+        }
+        if self.cat.feature("FEATURE_FLAG_RECIPES_MEALPLAN") and self.cat.feature("FEATURE_FLAG_RECIPES"):
+            meals = await self.r_get_meal_plan({"from_date": start, "to_date": end})
+            out["meals"] = meals if isinstance(meals, list) else []
+        if self.cat.feature("FEATURE_FLAG_TASKS"):
+            tasks = [{"day": str(t["due_date"])[:10], "task_id": to_int(t["id"]), "name": t["name"]} for t in await self.g.get("/tasks") if t.get("due_date")]
+            out["tasks"] = [t for t in tasks if start <= t["day"] <= end]
+            out["tasks_overdue"] = [t for t in tasks if t["day"] < start]
+        if self.cat.feature("FEATURE_FLAG_CHORES"):
+            out["chores"] = [{"day": str(c["next_estimated_execution_time"])[:10], "chore_id": to_int(c["chore_id"]), "name": c["chore_name"]}
+                             for c in await self.g.get("/chores") if c.get("next_estimated_execution_time") and str(c["next_estimated_execution_time"])[:10] <= end]
+        if self.cat.feature("FEATURE_FLAG_BATTERIES"):
+            out["battery_charges"] = [{"day": str(b["next_estimated_charge_time"])[:10], "name": (b.get("battery") or {}).get("name")}
+                                      for b in await self.g.get("/batteries") if inside(b.get("next_estimated_charge_time"))]
+        return out
+
+    async def r_get_spending(self, inp: dict) -> Any:
+        end = parse_date(inp.get("to_date"), "to_date") or self.today().isoformat()
+        start = parse_date(inp.get("from_date"), "from_date") or (self.today() - timedelta(days=30)).isoformat()
+        rows = await self.g.objects("stock_log", ["transaction_type=purchase", "undone=0", f"purchased_date>={start}", f"purchased_date<={end}"])
+        total, unpriced = 0.0, 0
+        stores: dict[str, float] = {}
+        groups: dict[str, float] = {}
+        products: dict[str, float] = {}
+        for r in rows:
+            cost = to_float(r.get("price")) * to_float(r.get("amount"))
+            if cost <= 0:
+                unpriced += 1
+                continue
+            total += cost
+            p = self.cat.product(r["product_id"]) or {}
+            store = self.cat.stores.get(to_int(r.get("shopping_location_id")) or -1, {}).get("name", "No store given")
+            group = self.cat.groups.get(to_int(p.get("product_group_id")) or -1, {}).get("name", "No group")
+            name = self.cat.product_name(r["product_id"])
+            stores[store] = stores.get(store, 0) + cost
+            groups[group] = groups.get(group, 0) + cost
+            products[name] = products.get(name, 0) + cost
+
+        def top(data: dict[str, float], n: int = 50) -> dict[str, str]:
+            return {k: self.cat.money(v) for k, v in sorted(data.items(), key=lambda kv: -kv[1])[:n]}
+
+        return {"from": start, "to": end, "total": self.cat.money(total), "by_store": top(stores), "by_product_group": top(groups),
+                "biggest_items": top(products, 10), "purchases_without_a_price": unpriced}
 
     # --------------------------------------------------- write tools: plan
 
@@ -855,7 +1258,15 @@ class Toolbox:
             verb = "Throw away" if spoiled else "Use"
             detail = f"{verb} all: {self.cat.amount(pid, amount)}{note}" if everything else f"{verb} {self.cat.amount(pid, amount)} of {fmt_num(in_stock)}"
             loc = self.need_location(it["location_id"]) if it.get("location_id") else None
-            out.append(action("consume", "remove", p["name"], detail, product_id=pid, amount=amount, spoiled=spoiled, location_id=loc))
+            stock_entry = None
+            if it.get("entry_id"):
+                entry = await self.g.get(f"/stock/entry/{to_int(it['entry_id'])}")
+                if not entry or to_int(entry.get("product_id")) != pid:
+                    raise ToolError(f"Stock entry {it['entry_id']} does not belong to {p['name']}. Use an entry id from get_stock.")
+                if amount > to_float(entry["amount"]):
+                    raise ToolError(f"That stock entry only holds {self.cat.amount(pid, entry['amount'])}.")
+                stock_entry = entry["stock_id"]
+            out.append(action("consume", "remove", p["name"], detail, product_id=pid, amount=amount, spoiled=spoiled, location_id=loc, stock_entry_id=stock_entry))
         return out
 
     async def p_open_products(self, inp: dict) -> list[dict]:
@@ -947,18 +1358,29 @@ class Toolbox:
             )
         return out
 
+    def need_list(self, list_id: Any) -> int:
+        lid = to_int(list_id) or 1
+        if self.cat.lists and lid not in self.cat.lists:
+            raise ToolError(f"There is no shopping list with id {list_id}.")
+        return lid
+
+    def list_suffix(self, list_id: int) -> str:
+        """Name the list on the card when the household has more than one."""
+        return f" · {self.cat.lists[list_id]['name']}" if len(self.cat.lists) > 1 and list_id in self.cat.lists else ""
+
     async def p_add_to_shopping_list(self, inp: dict) -> list[dict]:
-        list_id = to_int(inp.get("list_id")) or 1
+        list_id = self.need_list(inp.get("list_id"))
+        where = self.list_suffix(list_id)
         out = []
         for it in self.items(inp):
             amount = self.need_amount(it.get("amount", 1))
             note = (it.get("note") or "").strip() or None
             if it.get("product_id"):
                 p = await self.need_product(it["product_id"])
-                detail = self.cat.amount(p["id"], amount) + (f" · {note}" if note else "")
+                detail = self.cat.amount(p["id"], amount) + (f" · {note}" if note else "") + where
                 out.append(action("list_add", "list", p["name"], detail, product_id=int(p["id"]), amount=amount, note=note, list_id=list_id))
             elif note:
-                out.append(action("list_add", "list", note, fmt_num(amount) if amount != 1 else "", product_id=None, amount=amount, note=note, list_id=list_id))
+                out.append(action("list_add", "list", note, ((fmt_num(amount) if amount != 1 else "") + where).removeprefix(" · "), product_id=None, amount=amount, note=note, list_id=list_id))
             else:
                 raise ToolError("Each item needs product_id or note.")
         return out
@@ -989,26 +1411,36 @@ class Toolbox:
         if inp.get("done") is not None:
             body["done"] = 1 if inp["done"] else 0
             changes.append("ticked off" if inp["done"] else "unticked")
+        if inp.get("list_id"):
+            body["shopping_list_id"] = self.need_list(inp["list_id"])
+            changes.append(f"moved to {self.cat.lists[body['shopping_list_id']]['name']}")
         if not body:
             raise ToolError("No changes were given.")
-        return [action("list_update", "list", name, ", ".join(changes).capitalize(), item_id=int(row["id"]), body=body)]
+        return [action("list_update", "list", name, cap(", ".join(changes)), item_id=int(row["id"]), body=body)]
 
     async def p_add_low_stock_to_shopping_list(self, inp: dict) -> list[dict]:
-        missing = (await self.g.get("/stock/volatile")).get("missing_products") or []
-        if not missing:
-            raise ToolError("No product is below its minimum stock; nothing to add.")
-        names = ", ".join(m["name"] for m in missing[:12])
-        return [action("list_add_missing", "list", "Low-stock products", names, list_id=to_int(inp.get("list_id")) or 1)]
+        v = await self.g.get("/stock/volatile")
+        overdue, expired = bool(inp.get("also_overdue")), bool(inp.get("also_expired"))
+        names = [m["name"] for m in v.get("missing_products") or []]
+        if overdue:
+            names += [self.cat.product_name(r["product_id"]) for r in v.get("overdue_products") or []]
+        if expired:
+            names += [self.cat.product_name(r["product_id"]) for r in v.get("expired_products") or []]
+        if not names:
+            raise ToolError("Nothing is below its minimum stock" + (" or past its date" if overdue or expired else "") + "; nothing to add.")
+        list_id = self.need_list(inp.get("list_id"))
+        return [action("list_add_missing", "list", "Products to restock", ", ".join(dict.fromkeys(names[:15])) + self.list_suffix(list_id),
+                       list_id=list_id, overdue=overdue, expired=expired)]
 
     async def p_clear_shopping_list(self, inp: dict) -> list[dict]:
-        list_id = to_int(inp.get("list_id")) or 1
+        list_id = self.need_list(inp.get("list_id"))
         done_only = bool(inp.get("done_only"))
         rows = await self.g.objects("shopping_list", [f"shopping_list_id={list_id}"])
         count = len([r for r in rows if to_int(r.get("done"))] if done_only else rows)
         if not count:
             raise ToolError("There is nothing to remove from that list.")
         what = "ticked-off items" if done_only else "items"
-        return [action("list_clear", "remove", "Shopping list", f"Remove {'the' if done_only else 'all'} {count} {what}", list_id=list_id, done_only=done_only)]
+        return [action("list_clear", "remove", self.cat.lists.get(list_id, {}).get("name") or "Shopping list", f"Remove {'the' if done_only else 'all'} {count} {what}", list_id=list_id, done_only=done_only)]
 
     async def p_create_product(self, inp: dict) -> list[dict]:
         fields = self.check_new_product(inp)
@@ -1040,33 +1472,129 @@ class Toolbox:
         if inp.get("min_stock_amount") is not None:
             fields["min_stock_amount"] = to_float(inp["min_stock_amount"])
             changes.append(f"minimum stock {fmt_num(fields['min_stock_amount'])}")
-        for key, label in (("default_best_before_days", "shelf life"), ("default_best_before_days_after_open", "shelf life after opening")):
+        for key, label in (("default_best_before_days", "shelf life"), ("default_best_before_days_after_open", "shelf life after opening"),
+                           ("default_best_before_days_after_freezing", "shelf life after freezing"), ("default_best_before_days_after_thawing", "shelf life after thawing")):
             if inp.get(key) is not None:
-                fields[key] = to_int(inp[key])
+                fields[key] = to_int(inp[key]) or 0
                 changes.append(f"{label} {'never expires' if fields[key] == -1 else str(fields[key]) + ' days'}")
+        if inp.get("due_type") in ("best_before", "expiration"):
+            fields["due_type"] = 2 if inp["due_type"] == "expiration" else 1
+            changes.append("date is a hard expiry date" if fields["due_type"] == 2 else "date is a best-before date")
+        if inp.get("parent_product_id") is not None:
+            parent = to_int(inp["parent_product_id"])
+            if parent:
+                if parent == int(p["id"]):
+                    raise ToolError("A product cannot be its own parent.")
+                fields["parent_product_id"] = int((await self.need_product(parent))["id"])
+                changes.append(f"variant of {self.cat.product_name(parent)}")
+            else:
+                fields["parent_product_id"] = None
+                changes.append("no longer a variant of another product")
+        if inp.get("active") is not None:
+            fields["active"] = 1 if inp["active"] else 0
+            changes.append("in use again" if inp["active"] else "hidden as no longer used")
+        for key, label in (("quick_consume_amount", "quick-use amount"), ("calories", "calories per unit")):
+            if inp.get(key) is not None:
+                fields[key] = to_float(inp[key])
+                changes.append(f"{label} {fmt_num(fields[key])}")
+        for key, yes, no in (("treat_opened_as_out_of_stock", "opened packs count as used up", "opened packs still count as stock"),
+                             ("should_not_be_frozen", "should not be frozen", "may be frozen"),
+                             ("hide_on_stock_overview", "hidden from Grocy's stock overview", "shown on Grocy's stock overview")):
+            if inp.get(key) is not None:
+                fields[key] = 1 if inp[key] else 0
+                changes.append(yes if inp[key] else no)
         if not fields:
             raise ToolError("No changes were given.")
-        return [action("update_product", "edit", p["name"], "; ".join(changes).capitalize(), product_id=int(p["id"]), fields=fields)]
+        return [action("update_product", "edit", p["name"], cap("; ".join(changes)), product_id=int(p["id"]), fields=fields)]
+
+    def master_fields(self, kind: str, inp: dict) -> tuple[dict, list[str]]:
+        body: dict[str, Any] = {}
+        changes: list[str] = []
+        if inp.get("name_plural") and kind == "quantity_unit":
+            body["name_plural"] = str(inp["name_plural"]).strip()
+            changes.append(f"plural {body['name_plural']}")
+        if inp.get("is_freezer") is not None and kind == "location":
+            body["is_freezer"] = 1 if inp["is_freezer"] else 0
+            changes.append("a freezer" if inp["is_freezer"] else "not a freezer")
+        if inp.get("description") is not None and kind != "meal_plan_section":
+            body["description"] = str(inp["description"])
+            changes.append("description")
+        if inp.get("charge_interval_days") is not None and kind == "battery":
+            body["charge_interval_days"] = to_int(inp["charge_interval_days"]) or 0
+            changes.append(f"charge every {body['charge_interval_days']} days")
+        return body, changes
+
+    async def master_clash(self, entity: str, name: str, own_id: int = 0) -> None:
+        for r in await self.g.objects(entity):
+            if str(r.get("name") or "").strip().lower() == name.lower() and to_int(r["id"]) != own_id:
+                raise ToolError(f"{name!r} already exists with id {r['id']}.")
 
     async def p_create_master_item(self, inp: dict) -> list[dict]:
         kind, name = str(inp.get("kind")), str(inp.get("name", "")).strip()
-        entity, existing, label = {
-            "location": ("locations", self.cat.locations, "New location"),
-            "quantity_unit": ("quantity_units", self.cat.units, "New unit"),
-            "store": ("shopping_locations", self.cat.stores, "New store"),
-            "product_group": ("product_groups", self.cat.groups, "New product group"),
-        }.get(kind, (None, None, None))
-        if not entity or not name:
+        if kind not in MASTER or not name:
             raise ToolError("kind and name are required.")
-        clash = next((i for i, r in existing.items() if r["name"].strip().lower() == name.lower()), None)
-        if clash:
-            raise ToolError(f"{name!r} already exists with id {clash}.")
-        body: dict[str, Any] = {"name": name}
+        entity, word = MASTER[kind]
+        await self.master_clash(entity, name)
+        body, _ = self.master_fields(kind, inp)
         if kind == "quantity_unit":
-            body["name_plural"] = str(inp.get("name_plural") or name)
-        if kind == "location":
-            body["is_freezer"] = 1 if inp.get("is_freezer") else 0
-        return [action("create_master", "new", name, label, entity=entity, body=body)]
+            body.setdefault("name_plural", name)
+        return [action("create_master", "new", name, f"New {word}", entity=entity, body={"name": name, **body})]
+
+    async def p_update_master_item(self, inp: dict) -> list[dict]:
+        kind = str(inp.get("kind"))
+        if kind not in MASTER:
+            raise ToolError("Unknown kind.")
+        entity, word = MASTER[kind]
+        row = await self.need_row(entity, inp.get("id"), word)
+        body, changes = self.master_fields(kind, inp)
+        name = str(inp.get("name") or "").strip()
+        if name and name != row.get("name"):
+            await self.master_clash(entity, name, to_int(row["id"]))
+            body["name"] = name
+            changes.insert(0, f"rename to {name}")
+        if not body:
+            raise ToolError("No changes were given.")
+        return [action("update_master", "edit", row.get("name") or word, f"{word.capitalize()}: " + ", ".join(changes), entity=entity, row_id=to_int(row["id"]), body=body)]
+
+    async def p_add_product_barcode(self, inp: dict) -> list[dict]:
+        p = await self.need_product(inp.get("product_id"))
+        code = re.sub(r"\s", "", str(inp.get("barcode") or ""))
+        if len(code) < 4:
+            raise ToolError("That does not look like a barcode.")
+        taken = await self.g.objects("product_barcodes", [f"barcode={code}"])
+        if taken:
+            raise ToolError(f"That barcode already belongs to {self.cat.product_name(taken[0]['product_id'])}.")
+        body: dict[str, Any] = {"product_id": int(p["id"]), "barcode": code}
+        detail = f"Barcode {code}"
+        if inp.get("amount") is not None:
+            body["amount"] = self.need_amount(inp["amount"])
+            detail += f" · one scan = {self.cat.amount(p['id'], body['amount'])}"
+        if inp.get("store_id"):
+            if to_int(inp["store_id"]) not in self.cat.stores:
+                raise ToolError("Unknown store.")
+            body["shopping_location_id"] = to_int(inp["store_id"])
+        if inp.get("note"):
+            body["note"] = str(inp["note"])
+        return [action("create_row", "new", p["name"], detail, entity="product_barcodes", body=body, summary=f"Barcode {code} attached to {p['name']}")]
+
+    async def p_add_unit_conversion(self, inp: dict) -> list[dict]:
+        src, dst, factor = to_int(inp.get("from_unit_id")), to_int(inp.get("to_unit_id")), to_float(inp.get("factor"))
+        if src not in self.cat.units or dst not in self.cat.units or src == dst:
+            raise ToolError("from_unit_id and to_unit_id must be two different existing quantity units.")
+        if factor <= 0:
+            raise ToolError("factor must be greater than 0.")
+        body: dict[str, Any] = {"from_qu_id": src, "to_qu_id": dst, "factor": factor}
+        title = "Unit conversion"
+        query = [f"from_qu_id={src}", f"to_qu_id={dst}"]
+        if inp.get("product_id"):
+            p = await self.need_product(inp["product_id"])
+            body["product_id"], title = int(p["id"]), p["name"]
+            query.append(f"product_id={p['id']}")
+        existing = [r for r in await self.g.objects("quantity_unit_conversions", query) if bool(r.get("product_id")) == bool(body.get("product_id"))]
+        if existing:
+            raise ToolError(f"That conversion already exists (1 {self.cat.unit_name(src)} = {fmt_num(existing[0]['factor'])} {self.cat.unit_name(dst, 2)}).")
+        text = f"1 {self.cat.unit_name(src)} = {fmt_num(factor)} {self.cat.unit_name(dst, factor)}"
+        return [action("create_row", "new", title, text, entity="quantity_unit_conversions", body=body, summary=f"Saved: {text}")]
 
     async def recipe(self, recipe_id: Any) -> dict:
         try:
@@ -1080,25 +1608,80 @@ class Toolbox:
     async def p_consume_recipe(self, inp: dict) -> list[dict]:
         recipe = await self.recipe(inp.get("recipe_id"))
         positions = await self.g.objects("recipes_pos", [f"recipe_id={recipe['id']}"])
+        if not positions:
+            raise ToolError("That recipe has no ingredients, so there is nothing to take out of stock.")
         names = ", ".join(self.cat.product_name(p["product_id"]) for p in positions[:12])
-        return [action("recipe_consume", "remove", recipe["name"], f"Use up its ingredients: {names}", recipe_id=int(recipe["id"]))]
+        servings = to_float(inp.get("servings")) or None
+        if servings is not None and servings <= 0:
+            raise ToolError("servings must be greater than 0.")
+        portion = f" for {fmt_num(servings)} servings" if servings else ""
+        return [action("recipe_consume", "remove", recipe["name"], f"Use up its ingredients{portion}: {names}", recipe_id=int(recipe["id"]), servings=servings)]
 
     async def p_add_recipe_missing_to_shopping_list(self, inp: dict) -> list[dict]:
         recipe = await self.recipe(inp.get("recipe_id"))
         return [action("recipe_to_list", "list", recipe["name"], "Missing ingredients added to the list", recipe_id=int(recipe["id"]))]
 
+    async def ingredients(self, raw: Any) -> list[dict]:
+        out = []
+        for ing in raw or []:
+            if not isinstance(ing, dict):
+                raise ToolError("ingredients must be a list of objects.")
+            p = await self.need_product(ing.get("product_id"))
+            row = {"product_id": int(p["id"]), "amount": self.need_amount(ing.get("amount")), "qu_id": to_int(p.get("qu_id_stock")),
+                   "note": ing.get("note") or None, "variable_amount": ing.get("variable_amount") or None,
+                   "ingredient_group": ing.get("group") or None}
+            if ing.get("only_check_any_in_stock") is not None:
+                row["only_check_single_unit_in_stock"] = 1 if ing["only_check_any_in_stock"] else 0
+            out.append(row)
+        return out
+
+    def ingredient_text(self, ingredients: list[dict]) -> str:
+        return ", ".join(f"{i.get('variable_amount') or self.cat.amount(i['product_id'], i['amount'])} {self.cat.product_name(i['product_id'])}" for i in ingredients[:14])
+
     async def p_create_recipe(self, inp: dict) -> list[dict]:
         name = str(inp.get("name", "")).strip()
         if not name:
             raise ToolError("The recipe needs a name.")
-        ingredients = []
-        for ing in inp.get("ingredients") or []:
-            p = await self.need_product(ing.get("product_id"))
-            ingredients.append({"product_id": int(p["id"]), "amount": self.need_amount(ing.get("amount")), "qu_id": to_int(p.get("qu_id_stock")), "note": ing.get("note") or None})
+        if any(str(r["name"]).strip().lower() == name.lower() for r in await self.g.objects("recipes", ["type=normal"])):
+            raise ToolError(f"A recipe named {name!r} already exists. Use update_recipe to change it.")
+        ingredients = await self.ingredients(inp.get("ingredients"))
         if not ingredients:
             raise ToolError("The recipe needs at least one ingredient.")
-        detail = ", ".join(f"{self.cat.amount(i['product_id'], i['amount'])} {self.cat.product_name(i['product_id'])}" for i in ingredients[:12])
-        return [action("create_recipe", "new", name, detail, name=name, instructions=str(inp.get("instructions") or ""), servings=to_int(inp.get("servings")) or 1, ingredients=ingredients)]
+        return [action("create_recipe", "new", name, self.ingredient_text(ingredients), name=name, instructions=str(inp.get("instructions") or ""), servings=to_int(inp.get("servings")) or 1, ingredients=ingredients)]
+
+    async def p_update_recipe(self, inp: dict) -> list[dict]:
+        recipe = await self.recipe(inp.get("recipe_id"))
+        fields, changes = {}, []
+        if inp.get("name") and str(inp["name"]).strip() != recipe["name"]:
+            fields["name"] = str(inp["name"]).strip()
+            changes.append(f"rename to {fields['name']}")
+        if inp.get("instructions") is not None:
+            fields["description"] = recipe_html(str(inp["instructions"]))
+            changes.append("new instructions")
+        if inp.get("servings"):
+            fields["base_servings"] = to_int(inp["servings"])
+            changes.append(f"{fields['base_servings']} servings")
+        # Each given ingredient either changes the row for that product or is added as a new row.
+        current = {to_int(r["product_id"]): to_int(r["id"]) for r in await self.g.objects("recipes_pos", [f"recipe_id={recipe['id']}"])}
+        changed, added = [], []
+        for ing in await self.ingredients(inp.get("ingredients")):
+            if ing["product_id"] in current:
+                changed.append({"row_id": current[ing["product_id"]], **ing})
+            else:
+                added.append(ing)
+        if changed:
+            changes.append("change " + self.ingredient_text(changed))
+        if added:
+            changes.append("add " + self.ingredient_text(added))
+        if not changes:
+            raise ToolError("No changes were given.")
+        return [action("update_recipe", "edit", recipe["name"], cap("; ".join(changes)), recipe_id=int(recipe["id"]), fields=fields, changed=changed, added=added)]
+
+    async def need_section(self, section_id: Any) -> tuple[int, str]:
+        sections = await self.sections()
+        if to_int(section_id) not in sections:
+            raise ToolError(f"There is no meal plan section with id {section_id}. Known: {sections}")
+        return to_int(section_id), sections[to_int(section_id)]
 
     async def p_add_meal_plan_entry(self, inp: dict) -> list[dict]:
         day = parse_date(inp.get("day"), "day")
@@ -1115,29 +1698,185 @@ class Toolbox:
             title, body = str(inp["note"]), {"type": "note", "note": str(inp["note"])}
         else:
             raise ToolError("Give recipe_id, product_id or note.")
-        return [action("meal_plan_add", "list", title, f"Planned for {nice_date(day)}", body={**body, "day": day})]
+        detail = f"Planned for {nice_date(day)}"
+        if inp.get("section_id"):
+            body["section_id"], section = await self.need_section(inp["section_id"])
+            detail += f" · {section}"
+        return [action("meal_plan_add", "list", title, detail, body={**body, "day": day})]
+
+    async def p_update_meal_plan_entry(self, inp: dict) -> list[dict]:
+        row = await self.need_row("meal_plan", inp.get("entry_id"), "meal plan entry")
+        body, changes = {}, []
+        if inp.get("day"):
+            body["day"] = parse_date(inp["day"], "day")
+            changes.append(f"moved to {nice_date(body['day'])}")
+        if inp.get("servings") is not None:
+            amount = self.need_amount(inp["servings"], "servings")
+            body["product_amount" if row.get("type") == "product" else "recipe_servings"] = amount
+            changes.append(f"{fmt_num(amount)} servings")
+        if inp.get("section_id"):
+            body["section_id"], section = await self.need_section(inp["section_id"])
+            changes.append(section)
+        if inp.get("note") is not None:
+            if row.get("type") != "note":
+                raise ToolError("Only free-text entries have a note.")
+            body["note"] = str(inp["note"])
+            changes.append(f"now: {body['note']}")
+        if inp.get("done") is not None:
+            body["done"] = 1 if inp["done"] else 0
+            changes.append("done" if inp["done"] else "not done")
+        if not body:
+            raise ToolError("No changes were given.")
+        return [action("update_row", "list", await self.meal_title(row), cap(", ".join(changes)), entity="meal_plan", row_id=to_int(row["id"]), body=body, summary="Meal plan entry updated")]
+
+    async def chore(self, chore_id: Any) -> dict:
+        return await self.need_row("chores", chore_id, "chore")
 
     async def p_track_chore(self, inp: dict) -> list[dict]:
-        cid = to_int(inp.get("chore_id"))
-        chore = next((c for c in await self.g.get("/chores") if to_int(c["chore_id"]) == cid), None)
-        if not chore:
-            raise ToolError(f"There is no chore with id {cid}.")
-        return [action("chore_track", "list", chore["chore_name"], "Marked as done", chore_id=cid)]
+        chore = await self.chore(inp.get("chore_id"))
+        body: dict[str, Any] = {}
+        detail = "Marked as done"
+        if inp.get("skipped"):
+            body["skipped"], detail = True, "Skipped this time"
+        when = parse_date(inp.get("done_on"), "done_on")
+        if when:
+            body["tracked_time"] = f"{when} 12:00:00"
+            detail += f" on {nice_date(when)}"
+        if inp.get("done_by_user_id"):
+            body["done_by"], who = await self.need_user(inp["done_by_user_id"])
+            detail += f" by {who}"
+        return [action("chore_track", "list", chore["name"], detail, chore_id=int(chore["id"]), body=body)]
+
+    async def p_undo_chore(self, inp: dict) -> list[dict]:
+        row = await self.need_row("chores_log", inp.get("execution_id"), "chore execution")
+        if to_int(row.get("undone")):
+            raise ToolError("That execution was already undone.")
+        chore = await self.chore(row["chore_id"])
+        return [action("chore_undo", "undo", chore["name"], f"Undo: done {str(row.get('tracked_time'))[:10]}", execution_id=to_int(row["id"]))]
+
+    async def chore_fields(self, inp: dict) -> tuple[dict, list[str]]:
+        body: dict[str, Any] = {}
+        changes: list[str] = []
+        if inp.get("description") is not None:
+            body["description"] = str(inp["description"])
+            changes.append("description")
+        schedule = inp.get("schedule")
+        if schedule is not None:
+            if schedule not in ("manually", "daily", "weekly", "monthly", "yearly"):
+                raise ToolError("schedule must be manually, daily, weekly, monthly or yearly.")
+            body["period_type"] = schedule
+        if inp.get("every") is not None:
+            body["period_interval"] = max(1, to_int(inp["every"]) or 1)
+        if inp.get("weekdays") is not None:
+            days = [str(x).lower() for x in inp["weekdays"]]
+            if not days or any(x not in WEEKDAYS for x in days):
+                raise ToolError("weekdays must be English weekday names.")
+            body["period_config"] = ",".join(x for x in WEEKDAYS if x in days)
+        if inp.get("day_of_month") is not None:
+            if not 1 <= (to_int(inp["day_of_month"]) or 0) <= 31:
+                raise ToolError("day_of_month must be between 1 and 31.")
+            body["period_days"] = to_int(inp["day_of_month"])
+        if schedule == "weekly" and "period_config" not in body:
+            raise ToolError("A weekly chore needs weekdays.")
+        if schedule == "monthly" and "period_days" not in body:
+            raise ToolError("A monthly chore needs day_of_month.")
+        if body.keys() & {"period_type", "period_interval", "period_config", "period_days"}:
+            changes.append(self.chore_schedule(body) if schedule else "schedule details")
+        if inp.get("start_date"):
+            body["start_date"] = parse_date(inp["start_date"], "start_date") + " 00:00:00"
+            changes.append(f"starting {nice_date(body['start_date'][:10])}")
+        if inp.get("assignment") is not None:
+            if inp["assignment"] not in ("no-assignment", "who-least-did-first", "random", "in-alphabetical-order"):
+                raise ToolError("Unknown assignment.")
+            body["assignment_type"] = inp["assignment"]
+            changes.append({"no-assignment": "nobody assigned", "who-least-did-first": "whoever did it least goes next", "random": "random person", "in-alphabetical-order": "taking turns"}[inp["assignment"]])
+        if inp.get("assigned_user_ids") is not None:
+            people = [await self.need_user(u) for u in inp["assigned_user_ids"]]
+            body["assignment_config"] = ",".join(str(i) for i, _ in people)
+            changes.append("for " + ", ".join(n for _, n in people))
+        return body, changes
+
+    async def p_create_chore(self, inp: dict) -> list[dict]:
+        name = str(inp.get("name", "")).strip()
+        if not name:
+            raise ToolError("The chore needs a name.")
+        await self.master_clash("chores", name)
+        body, changes = await self.chore_fields(inp)
+        if "period_type" not in body:
+            raise ToolError("schedule is required.")
+        body = {"name": name, "period_interval": 1, "track_date_only": 1, "assignment_type": "no-assignment", **body}
+        if body.get("assignment_config") and body["assignment_type"] == "no-assignment":
+            body["assignment_type"] = "who-least-did-first"
+        return [action("create_row", "new", name, "New chore: " + ", ".join(c for c in changes if c != "description"), entity="chores", body=body, summary=f"Chore {name} created")]
+
+    async def p_update_chore(self, inp: dict) -> list[dict]:
+        chore = await self.chore(inp.get("chore_id"))
+        body, changes = await self.chore_fields(inp)
+        name = str(inp.get("name") or "").strip()
+        if name and name != chore["name"]:
+            await self.master_clash("chores", name, int(chore["id"]))
+            body["name"] = name
+            changes.insert(0, f"rename to {name}")
+        if inp.get("active") is not None:
+            body["active"] = 1 if inp["active"] else 0
+            changes.append("active again" if inp["active"] else "retired")
+        if not body:
+            raise ToolError("No changes were given.")
+        return [action("update_row", "edit", chore["name"], cap(", ".join(changes)), entity="chores", row_id=int(chore["id"]), body=body, summary=f"Chore {chore['name']} updated")]
+
+    async def task_extras(self, inp: dict) -> tuple[dict, list[str]]:
+        body: dict[str, Any] = {}
+        changes: list[str] = []
+        if inp.get("category_id"):
+            category = await self.need_row("task_categories", inp["category_id"], "task category")
+            body["category_id"] = to_int(category["id"])
+            changes.append(category["name"])
+        if inp.get("assigned_to_user_id"):
+            body["assigned_to_user_id"], who = await self.need_user(inp["assigned_to_user_id"])
+            changes.append(f"for {who}")
+        return body, changes
 
     async def p_add_task(self, inp: dict) -> list[dict]:
         name = str(inp.get("name", "")).strip()
         if not name:
             raise ToolError("The task needs a name.")
         due = parse_date(inp.get("due_date"), "due_date")
-        body = {"name": name, "description": str(inp.get("description") or ""), **({"due_date": due} if due else {})}
-        return [action("task_add", "list", name, f"Task added{', due ' + nice_date(due) if due else ''}", body=body)]
+        extra, notes = await self.task_extras(inp)
+        body = {"name": name, "description": str(inp.get("description") or ""), **({"due_date": due} if due else {}), **extra}
+        return [action("task_add", "list", name, " · ".join([f"Task added{', due ' + nice_date(due) if due else ''}", *notes]), body=body)]
+
+    async def p_update_task(self, inp: dict) -> list[dict]:
+        task = await self.need_row("tasks", inp.get("task_id"), "task")
+        body, changes = await self.task_extras(inp)
+        if inp.get("name") and str(inp["name"]).strip() != task["name"]:
+            body["name"] = str(inp["name"]).strip()
+            changes.insert(0, f"renamed to {body['name']}")
+        if inp.get("due_date") is not None:
+            body["due_date"] = parse_date(inp["due_date"], "due_date")
+            changes.append(f"due {nice_date(body['due_date'])}" if body["due_date"] else "no due date")
+        if inp.get("description") is not None:
+            body["description"] = str(inp["description"])
+            changes.append("new description")
+        if not body:
+            raise ToolError("No changes were given.")
+        return [action("update_row", "list", task["name"], cap(", ".join(changes)), entity="tasks", row_id=to_int(task["id"]), body=body, summary="Task updated")]
 
     async def p_complete_task(self, inp: dict) -> list[dict]:
-        tid = to_int(inp.get("task_id"))
-        task = next((t for t in await self.g.get("/tasks") if to_int(t["id"]) == tid), None)
-        if not task:
-            raise ToolError(f"There is no open task with id {tid}.")
-        return [action("task_complete", "list", task["name"], "Task completed", task_id=tid)]
+        task = await self.need_row("tasks", inp.get("task_id"), "task")
+        if to_int(task.get("done")):
+            raise ToolError("That task is already completed.")
+        return [action("task_complete", "list", task["name"], "Task completed", task_id=to_int(task["id"]))]
+
+    async def p_reopen_task(self, inp: dict) -> list[dict]:
+        task = await self.need_row("tasks", inp.get("task_id"), "task")
+        if not to_int(task.get("done")):
+            raise ToolError("That task is still open.")
+        return [action("task_reopen", "undo", task["name"], "Open again", task_id=to_int(task["id"]))]
+
+    async def p_charge_battery(self, inp: dict) -> list[dict]:
+        battery = await self.need_row("batteries", inp.get("battery_id"), "battery")
+        when = parse_date(inp.get("charged_on"), "charged_on")
+        return [action("battery_charge", "list", battery["name"], f"Charged{' on ' + nice_date(when) if when else ''}", battery_id=to_int(battery["id"]), body={"tracked_time": f"{when} 12:00:00"} if when else {})]
 
     # ------------------------------------------------ write tools: execute
 
@@ -1173,10 +1912,12 @@ class Toolbox:
             pass
         return self.booked(rows, f"Added {self.cat.amount(product_id, amount)} {self.cat.product_name(product_id)}", product_id=product_id, **extra)
 
-    async def x_consume(self, product_id, amount, spoiled, location_id) -> dict:
+    async def x_consume(self, product_id, amount, spoiled, location_id, stock_entry_id=None) -> dict:
         body = {"amount": amount, "transaction_type": "consume", "spoiled": spoiled}
         if location_id:
             body["location_id"] = location_id
+        if stock_entry_id:
+            body["stock_entry_id"] = stock_entry_id
         rows = await self.g.post(f"/stock/products/{product_id}/consume", body)
         left = await self.stock_amount(product_id)
         return self.booked(rows, f"Took {self.cat.amount(product_id, amount)} {self.cat.product_name(product_id)} out of stock; {self.cat.amount(product_id, left)} left", product_id=product_id)
@@ -1224,9 +1965,13 @@ class Toolbox:
         await self.g.put(f"/objects/shopping_list/{item_id}", body)
         return {"summary": f"Shopping list item {item_id} updated"}
 
-    async def x_list_add_missing(self, list_id) -> dict:
+    async def x_list_add_missing(self, list_id, overdue=False, expired=False) -> dict:
         await self.g.post("/stock/shoppinglist/add-missing-products", {"list_id": list_id})
-        return {"summary": "Low-stock products are on the shopping list"}
+        if overdue:
+            await self.g.post("/stock/shoppinglist/add-overdue-products", {"list_id": list_id})
+        if expired:
+            await self.g.post("/stock/shoppinglist/add-expired-products", {"list_id": list_id})
+        return {"summary": "Those products are on the shopping list"}
 
     async def x_list_clear(self, list_id, done_only) -> dict:
         await self.g.post("/stock/shoppinglist/clear", {"list_id": list_id, "done_only": done_only})
@@ -1247,7 +1992,32 @@ class Toolbox:
         await self.cat.refresh(force=True)
         return {"summary": f"Created {body['name']}", "created_id": new_id}
 
-    async def x_recipe_consume(self, recipe_id) -> dict:
+    async def x_update_master(self, entity, row_id, body) -> dict:
+        await self.g.put(f"/objects/{entity}/{row_id}", body)
+        await self.cat.refresh(force=True)
+        return {"summary": "Updated"}
+
+    # Generic create and edit of one row; the plan step has already validated entity, id and body.
+    async def x_create_row(self, entity, body, summary) -> dict:
+        new_id = await self.g.create(entity, body)
+        return {"summary": summary, "created_id": new_id}
+
+    async def x_update_row(self, entity, row_id, body, summary) -> dict:
+        await self.g.put(f"/objects/{entity}/{row_id}", body)
+        return {"summary": summary}
+
+    async def x_update_recipe(self, recipe_id, fields, changed, added) -> dict:
+        if fields:
+            await self.g.put(f"/objects/recipes/{recipe_id}", fields)
+        for ing in changed:
+            await self.g.put(f"/objects/recipes_pos/{ing['row_id']}", {k: v for k, v in ing.items() if k != "row_id" and v is not None})
+        for ing in added:
+            await self.g.create("recipes_pos", {"recipe_id": recipe_id, **{k: v for k, v in ing.items() if v is not None}})
+        return {"summary": "Recipe updated"}
+
+    async def x_recipe_consume(self, recipe_id, servings=None) -> dict:
+        if servings:
+            await self.g.put(f"/objects/recipes/{recipe_id}", {"desired_servings": servings})
         await self.g.post(f"/recipes/{recipe_id}/consume")
         return {"summary": "Recipe ingredients taken out of stock"}
 
@@ -1256,8 +2026,7 @@ class Toolbox:
         return {"summary": "Missing ingredients are on the shopping list"}
 
     async def x_create_recipe(self, name, instructions, servings, ingredients) -> dict:
-        html = "".join(f"<p>{line}</p>" for line in instructions.replace("<", "&lt;").splitlines() if line.strip())
-        rid = await self.g.create("recipes", {"name": name, "description": html, "base_servings": servings})
+        rid = await self.g.create("recipes", {"name": name, "description": recipe_html(instructions), "base_servings": servings, "desired_servings": servings})
         for ing in ingredients:
             await self.g.create("recipes_pos", {"recipe_id": rid, **{k: v for k, v in ing.items() if v is not None}})
         return {"summary": f"Saved recipe {name}", "created_recipe_id": rid}
@@ -1266,9 +2035,22 @@ class Toolbox:
         await self.g.create("meal_plan", body)
         return {"summary": f"Meal planned for {body['day']}"}
 
-    async def x_chore_track(self, chore_id) -> dict:
-        await self.g.post(f"/chores/{chore_id}/execute")
-        return {"summary": "Chore recorded as done"}
+    async def x_chore_track(self, chore_id, body=None) -> dict:
+        row = await self.g.post(f"/chores/{chore_id}/execute", body or {})
+        execution = row.get("id") if isinstance(row, dict) else None
+        return {"summary": "Chore recorded", **({"execution_id": execution} if execution else {})}
+
+    async def x_chore_undo(self, execution_id) -> dict:
+        await self.g.post(f"/chores/executions/{execution_id}/undo")
+        return {"summary": "Chore execution undone"}
+
+    async def x_task_reopen(self, task_id) -> dict:
+        await self.g.post(f"/tasks/{task_id}/undo")
+        return {"summary": "Task is open again"}
+
+    async def x_battery_charge(self, battery_id, body) -> dict:
+        await self.g.post(f"/batteries/{battery_id}/charge", body)
+        return {"summary": "Battery charge recorded"}
 
     async def x_task_add(self, body) -> dict:
         tid = await self.g.create("tasks", body)

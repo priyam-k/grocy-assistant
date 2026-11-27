@@ -27,6 +27,12 @@ class FakeGrocy:
         }
         self.stock = {1: 2.0, 2: 6.0}
         self.shopping: dict[int, dict] = {}
+        self.rows: dict[str, dict[int, dict]] = {  # generic tables: recipes, tasks, ...
+            "recipes": {1: {"id": 1, "name": "Omelette", "type": "normal", "base_servings": 1}},
+            "recipes_pos": {1: {"id": 1, "recipe_id": 1, "product_id": 2, "amount": 2, "qu_id": 1}},
+            "tasks": {1: {"id": 1, "name": "Fix tap", "done": 0}},
+            "shopping_lists": {1: {"id": 1, "name": "Shopping list"}, 2: {"id": 2, "name": "Costco"}},
+        }
         self.calls: list[tuple[str, str, dict]] = []
         self.tx = 0
         self.undone: list[str] = []
@@ -42,13 +48,28 @@ class FakeGrocy:
             "locations": [{"id": 1, "name": "Fridge"}, {"id": 2, "name": "Pantry"}],
             "shopping_locations": [{"id": 1, "name": "Costco"}],
             "product_groups": [],
-            "shopping_lists": [{"id": 1, "name": "Shopping list"}],
             "shopping_list": list(self.shopping.values()),
+            **{name: list(rows.values()) for name, rows in self.rows.items()},
         }
+        if m := re.fullmatch(r"/objects/(\w+)/(\d+)", path):
+            if request.method == "GET":
+                return ok(self.rows[m[1]][int(m[2])])
+            if request.method == "PUT" and m[1] in self.rows:
+                self.rows[m[1]][int(m[2])].update(body)
+                return ok()
         if m := re.fullmatch(r"/objects/(\w+)", path):
             entity = m[1]
             if request.method == "GET":
-                return ok(tables[entity])
+                rows = tables.get(entity, [])
+                for cond in request.url.params.get_list("query[]"):  # only simple equality filters
+                    if "=" in cond and not any(c in cond for c in "<>~!"):
+                        key, value = cond.split("=", 1)
+                        rows = [r for r in rows if str(r.get(key)) == value]
+                return ok(rows)
+            if entity in self.rows:
+                new_id = max(self.rows[entity], default=0) + 1
+                self.rows[entity][new_id] = {"id": new_id, **body}
+                return ok({"created_object_id": new_id})
             if entity == "products":
                 new_id = max(self.products) + 1
                 self.products[new_id] = {"id": new_id, "active": 1, **body}
@@ -159,6 +180,35 @@ def test_grocy_help_returns_guide_and_local_setup(world):
         help_ = await world.toolbox.read("grocy_help", {})
         assert "Minimum stock amount" in help_["guide"]
         assert "CHORES" in help_["this_household"]["features_switched_off"]
+
+    run(go())
+
+
+def test_recipe_edit_changes_and_adds_ingredients_without_removing_any(world):
+    async def go():
+        actions = await world.toolbox.plan("update_recipe", {"recipe_id": 1, "servings": 2, "ingredients": [
+            {"product_id": 2, "amount": 3}, {"product_id": 1, "amount": 1, "variable_amount": "a splash"}]})
+        assert "change 3 pieces Eggs" in actions[0]["detail"] and "add a splash Milk" in actions[0]["detail"]
+        assert (await world.toolbox.execute(actions[0]))["ok"]
+        rows = world.fake.rows["recipes_pos"]
+        assert rows[1]["amount"] == 3 and rows[2]["product_id"] == 1 and len(rows) == 2
+        assert world.fake.rows["recipes"][1]["base_servings"] == 2
+        assert not [c for c in world.fake.calls if c[0] == "DELETE"]
+
+    run(go())
+
+
+def test_items_go_to_the_named_list_and_tasks_can_be_edited(world):
+    async def go():
+        actions = await world.toolbox.plan("add_to_shopping_list", {"items": [{"note": "candles"}], "list_id": 2})
+        assert actions[0]["detail"] == "Costco" and actions[0]["args"]["list_id"] == 2
+        with pytest.raises(ToolError):
+            await world.toolbox.plan("add_to_shopping_list", {"items": [{"note": "candles"}], "list_id": 9})
+        renamed = await world.toolbox.plan("update_master_item", {"kind": "shopping_list", "id": 2, "name": "Costco run"})
+        assert (await world.toolbox.execute(renamed[0]))["ok"] and world.fake.rows["shopping_lists"][2]["name"] == "Costco run"
+        world.fake.rows["task_categories"] = {}
+        edit = await world.toolbox.plan("update_task", {"task_id": 1, "name": "Fix kitchen tap", "due_date": "2026-12-01"})
+        assert (await world.toolbox.execute(edit[0]))["ok"] and world.fake.rows["tasks"][1]["due_date"] == "2026-12-01"
 
     run(go())
 

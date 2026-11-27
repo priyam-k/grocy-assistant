@@ -100,10 +100,24 @@ shopping. Items can be ticked off as done. Purchasing a product takes it off the
 
 ## What this chat assistant can and cannot do
 
-Through this chat: read stock, add purchases, consume, mark opened, correct amounts, transfer
-between locations, edit stock entries, undo bookings, manage the shopping list, look up and
-create recipes, consume a recipe, use the meal plan, track chores, add and complete tasks, and
-create or edit products, locations, stores, units and product groups.
+Through this chat:
 
-Only in Grocy itself: deleting anything, barcodes and scanning, product pictures, batteries,
-equipment, userfields, users and permissions, settings and feature flags, reports and printing.
+- Stock: read it, add purchases, consume (also from one specific batch), mark opened, correct
+  amounts, move between locations, edit a batch, undo bookings, see spending.
+- Products: create and edit (shelf life, minimum stock, default location and store, group, parent
+  product, best-before versus expiry, hide when no longer used), attach barcodes, add unit
+  conversions.
+- Shopping lists: several lists, add, change, tick off, move between lists, remove items, add
+  everything that is low, overdue or expired, clear a list.
+- Recipes: read, create, rename, change instructions and servings, add or change ingredients,
+  cook (consume) for a number of servings, put missing ingredients on the list.
+- Meal plan: read, add recipes, products or notes to a day and section, move, change, mark done.
+- Tasks: add, edit, assign, complete, reopen. Chores: create, edit, retire, record or skip, undo.
+- Batteries: list and record charges. Calendar: everything dated in a period.
+- Lists Grocy is organised by: create and rename locations, stores, units, product groups,
+  shopping lists, meal plan sections, task categories, batteries, equipment.
+
+Only in Grocy itself: deleting anything other than shopping list items (products, recipes, recipe
+ingredients, meal plan entries, tasks, chores), merging products, product pictures, scanning with
+the camera, manuals for equipment, userfields, users and permissions, settings and feature flags,
+printing.
