@@ -55,3 +55,16 @@ GROCY_URL=http://docker:9283 .venv/bin/uvicorn app.main:app --port 8484 --reload
 ```
 
 Token usage per day, user and model: `GET /api/usage`.
+
+## Who changed what
+
+Grocy books every API change under the owner of the API key, so by default its journal shows one
+user for everything. Three things identify the real person:
+
+- `GET /api/activity` lists every change the assistant made with the signed-in email.
+- Purchases and stock corrections carry a note on the stock entry: `via Pantry: <email>`.
+  (Grocy's consume and open calls accept no note.)
+- Optionally set `GROCY_USER_KEYS=email=key,...` with an API key created by each person's own
+  Grocy user. Their changes then appear under their name in Grocy's own journal.
+
+`GROCY_PUBLIC_URL` adds an "Open Grocy" link to the menu.

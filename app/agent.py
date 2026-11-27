@@ -135,6 +135,7 @@ class Agent:
                 if act_id in approved:
                     await emit({"type": "tool", "label": f"Saving {act['title']}"})
                     result = await self.toolbox.execute(act)
+                    self.db.audit(conv.user, conv.id, act["title"], act["detail"], result)
                     rows.append(for_model(act, result))
                     card_rows.append(for_card(act, act_id, result))
                 else:
@@ -293,6 +294,7 @@ class Agent:
                 rows = []
                 for i, act in enumerate(actions):
                     result = await self.toolbox.execute(act)
+                    self.db.audit(conv.user, conv.id, act["title"], act["detail"], result)
                     rows.append(for_model(act, result))
                     auto_rows.append(for_card(act, f"a{len(auto_rows)}", result))
                 results[use["id"]] = result_block(use["id"], {"results": rows})

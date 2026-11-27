@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS display (
     item TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS display_conversation ON display (conversation_id, id);
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    user TEXT NOT NULL,
+    conversation_id TEXT,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    transaction_id TEXT
+);
 CREATE TABLE IF NOT EXISTS usage (
     day TEXT NOT NULL,
     user TEXT NOT NULL,
@@ -65,6 +75,13 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        if "title" not in [r["name"] for r in self.conn.execute("PRAGMA table_info(conversations)")]:
+            self.conn.execute("ALTER TABLE conversations ADD COLUMN title TEXT")
+        # Chats from before titles existed: name them after their first message.
+        for row in self.conn.execute("SELECT id FROM conversations WHERE title IS NULL").fetchall():
+            first = next((i for i in self.shown(row["id"]) if i.get("t") == "user"), None)
+            if first:
+                self.set_title(row["id"], (first.get("text") or "Photo")[:80].splitlines()[0])
 
     # ------------------------------------------------------ conversations
 
@@ -113,6 +130,25 @@ class DB:
                 conv.id,
             ),
         )
+
+    def set_title(self, conversation_id: str, title: str) -> None:
+        self.conn.execute("UPDATE conversations SET title=? WHERE id=? AND title IS NULL", (title, conversation_id))
+
+    def history(self, user: str, limit: int = 60) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, title, updated_at FROM conversations WHERE user=? AND title IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT ?", (user, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def audit(self, user: str, conversation_id: str | None, title: str, detail: str, result: dict) -> None:
+        self.conn.execute(
+            "INSERT INTO audit (at, user, conversation_id, title, detail, ok, transaction_id) VALUES (?,?,?,?,?,?,?)",
+            (time.time(), user, conversation_id, title, detail, 1 if result.get("ok") else 0, result.get("transaction_id")),
+        )
+
+    def audit_log(self, limit: int = 200) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))]
 
     # ------------------------------------------------------------ display
 

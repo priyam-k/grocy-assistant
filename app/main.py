@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from . import config
 from .agent import Agent, Emit
 from .db import DB, Conversation
-from .grocy import Catalog, Grocy, GrocyError
+from .grocy import Catalog, Grocy, GrocyError, actor_email, actor_key
 from .tools import Toolbox
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -107,7 +107,13 @@ def lock_for(conversation_id: str) -> asyncio.Lock:
     return S.locks.setdefault(conversation_id, asyncio.Lock())
 
 
-def stream(conv: Conversation, run: Callable[[Emit], Awaitable[None]], first: list[dict] | None = None) -> StreamingResponse:
+def act_as(user: "User") -> None:
+    """Changes made in this task are attributed to this person (see grocy.py)."""
+    actor_email.set(user.email)
+    actor_key.set(config.GROCY_USER_KEYS.get(user.email, ""))
+
+
+def stream(conv: Conversation, user: "User", run: Callable[[Emit], Awaitable[None]], first: list[dict] | None = None) -> StreamingResponse:
     """Run a turn in its own task (so it finishes even if the phone drops off) and stream its events."""
     lock = lock_for(conv.id)
     if lock.locked():
@@ -117,6 +123,7 @@ def stream(conv: Conversation, run: Callable[[Emit], Awaitable[None]], first: li
         queue.put_nowait(event)
 
     async def worker() -> None:
+        act_as(user)
         async with lock:
             try:
                 await run(queue.put)
@@ -174,12 +181,23 @@ async def state(user: User = Depends(current_user)):
     return {
         "user": user.model_dump(),
         "stt": "server" if config.STT_API_KEY else "browser",
-        "conversation": {
-            "id": conv.id,
-            "items": S.db.shown(conv.id),
-            "busy": lock_for(conv.id).locked(),
-        } if conv else None,
+        "grocy_url": config.GROCY_PUBLIC_URL,
+        "history": S.db.history(user.email),
+        "conversation": {"id": conv.id, "items": S.db.shown(conv.id)} if conv else None,
     }
+
+
+@app.get("/api/conversations")
+async def conversations(user: User = Depends(current_user)):
+    return S.db.history(user.email)
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def conversation(conversation_id: str, user: User = Depends(current_user)):
+    conv = S.db.get(conversation_id, user.email)
+    if not conv:
+        raise HTTPException(404, "That chat no longer exists.")
+    return {"id": conv.id, "items": S.db.shown(conv.id)}
 
 
 @app.post("/api/chat")
@@ -215,9 +233,11 @@ async def chat(
     context = f"[{now:%A %-d %B %Y, %-I:%M %p} · from {user.name} · {'spoken' if voice else 'typed'}]"
     blocks.append({"type": "text", "text": f"{context}\n{text or '(photo attached, no text)'}"})
     shown = S.db.show(conv.id, {"t": "user", "text": text, "images": names, "voice": voice})
+    S.db.set_title(conv.id, (text[:80] or "Photo").splitlines()[0])
 
     return stream(
         conv,
+        user,
         lambda emit: S.agent.user_turn(conv, blocks, emit),
         first=[{"type": "start", "conversation_id": conv.id, "item": shown}],
     )
@@ -233,7 +253,7 @@ async def confirm(body: ConfirmBody, user: User = Depends(current_user)):
     conv = S.db.get(body.conversation_id, user.email)
     if not conv:
         raise HTTPException(404, "Conversation not found.")
-    return stream(conv, lambda emit: S.agent.confirm(conv, set(body.approved), emit))
+    return stream(conv, user, lambda emit: S.agent.confirm(conv, set(body.approved), emit))
 
 
 class UndoBody(BaseModel):
@@ -248,6 +268,7 @@ async def undo(body: UndoBody, user: User = Depends(current_user)):
     if not conv or not shown or shown[0].get("t") != "card" or shown[0].get("undone"):
         raise HTTPException(404, "Nothing to undo.")
     card = shown[0]
+    act_as(user)
     async with lock_for(conv.id):
         conv = S.db.get(body.conversation_id, user.email)
         undone, failed = [], []
@@ -257,6 +278,7 @@ async def undo(body: UndoBody, user: User = Depends(current_user)):
             try:
                 await S.grocy.post(f"/stock/transactions/{act['transaction_id']}/undo")
                 undone.append(act["title"])
+                S.db.audit(user.email, conv.id, act["title"], "Undone: " + act["detail"], {"ok": True, "transaction_id": act["transaction_id"]})
             except GrocyError as e:
                 failed.append(f"{act['title']} ({e})")
         if undone:
@@ -302,6 +324,12 @@ async def upload(name: str, user: User = Depends(current_user)):
     if not re.fullmatch(r"[0-9a-f]{32}\.(jpg|png|webp|gif)", name) or not (config.UPLOAD_DIR / name).exists():
         raise HTTPException(404)
     return FileResponse(config.UPLOAD_DIR / name, headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+@app.get("/api/activity")
+async def activity(user: User = Depends(current_user)):
+    """Who changed what, newest first."""
+    return S.db.audit_log()
 
 
 @app.get("/api/usage")

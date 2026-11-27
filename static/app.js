@@ -90,7 +90,11 @@ function showUser(item) {
   }
   if (item.text) {
     const bubble = el("div", "msg user");
-    if (item.voice) bubble.append(el("span", "voice-tag", "🎙"));
+    if (item.voice) {
+      const tag = el("span", "voice-tag");
+      tag.innerHTML = '<svg viewBox="0 0 24 24" aria-label="Spoken"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>';
+      bubble.append(tag);
+    }
     bubble.append(document.createTextNode(item.text));
     thread.append(bubble);
   }
@@ -110,7 +114,7 @@ function showError(message) {
   scrollDown(true);
 }
 
-const BADGE = { add: "+", new: "+", remove: "−", open: "◐", edit: "✎", list: "✓", undo: "↺" };
+const BADGE = { add: "+", new: "+", remove: "−", open: "○", edit: "✎", list: "✓", undo: "↺" };
 
 function showCard(item) {
   hideWelcome();
@@ -276,6 +280,7 @@ async function run(request) {
     state.liveBubble = null;
     setActivity(null);
     refreshComposer();
+    refreshHistory();
     afterTurn();
   }
 }
@@ -555,15 +560,73 @@ $("rec-cancel").addEventListener("click", () => { stopListening(true); releaseMi
 $("speak-toggle").addEventListener("click", () => {
   state.speak = !state.speak;
   localStorage.setItem("speak", state.speak ? "1" : "0");
-  $("speak-toggle").setAttribute("aria-pressed", state.speak);
+  $("speak-toggle").setAttribute("aria-checked", state.speak);
   if (!state.speak) window.speechSynthesis?.cancel();
   toast(state.speak ? "When you talk to me, I'll answer out loud." : "I'll stay quiet.");
 });
+// ------------------------------------------------------- menu and history
+
+function setMenu(open) {
+  document.body.classList.toggle("menu-open", open);
+  $("scrim").hidden = !open;
+}
+$("menu").addEventListener("click", () => setMenu(true));
+$("avatar-top").addEventListener("click", () => setMenu(true));
+$("menu-close").addEventListener("click", () => setMenu(false));
+$("scrim").addEventListener("click", () => setMenu(false));
+
+function clearThread() {
+  state.pendingCard = null;
+  [...thread.children].forEach((n) => n.id !== "welcome" && n.remove());
+}
+
+function renderHistory(list) {
+  const nav = $("history");
+  nav.replaceChildren();
+  if (!list.length) nav.append(el("div", "empty", "Your chats will show up here."));
+  for (const chat of list) {
+    const b = el("button", chat.id === state.conversation ? "active" : null, chat.title);
+    b.type = "button";
+    b.title = new Date(chat.updated_at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    b.addEventListener("click", () => openConversation(chat.id));
+    nav.append(b);
+  }
+  state.history = list;
+}
+
+async function refreshHistory() {
+  try {
+    const r = await fetch("/api/conversations");
+    if (r.ok) renderHistory(await r.json());
+  } catch { /* the list is a convenience; keep the old one */ }
+}
+
+async function openConversation(id) {
+  if (state.busy) return;
+  setMenu(false);
+  try {
+    const r = await fetch(`/api/conversations/${id}`);
+    if (!r.ok) throw new Error();
+    const chat = await r.json();
+    clearThread();
+    state.conversation = chat.id;
+    $("welcome").hidden = chat.items.length > 0;
+    chat.items.forEach(showItem);
+    scrollDown(true);
+    renderHistory(state.history || []);
+  } catch {
+    toast("I couldn't open that chat.");
+  }
+}
+
 $("new-chat").addEventListener("click", () => {
   if (state.busy) return;
-  state.conversation = null; state.pendingCard = null;
-  [...thread.children].forEach((n) => n.id !== "welcome" && n.remove());
+  setMenu(false);
+  state.conversation = null;
+  clearThread();
   $("welcome").hidden = false;
+  renderHistory(state.history || []);
+  input.focus();
 });
 document.querySelector(".quick").addEventListener("click", (e) => {
   const b = e.target.closest("button");
@@ -574,7 +637,7 @@ document.querySelector(".quick").addEventListener("click", (e) => {
 });
 
 async function boot() {
-  $("speak-toggle").setAttribute("aria-pressed", state.speak);
+  $("speak-toggle").setAttribute("aria-checked", state.speak);
   try {
     const r = await fetch("/api/state");
     if (!r.ok) throw new Error();
@@ -582,11 +645,18 @@ async function boot() {
     state.stt = data.stt;
     const hour = new Date().getHours();
     $("hello").textContent = `${hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening"}, ${data.user.name}`;
+    const initial = (data.user.name || "?").charAt(0).toUpperCase();
+    $("avatar").textContent = $("avatar-top").textContent = initial;
+    $("avatar-top").title = data.user.email;
+    $("me-name").textContent = data.user.name;
+    $("me-email").textContent = data.user.email.endsWith("@local") ? "Not signed in" : data.user.email;
+    if (data.grocy_url) { $("grocy-link").href = data.grocy_url; $("grocy-link").hidden = false; }
     if (data.conversation && data.conversation.items.length) {
       state.conversation = data.conversation.id;
       data.conversation.items.forEach(showItem);
       scrollDown(true);
     }
+    renderHistory(data.history || []);
   } catch {
     showError("I couldn't load. Please refresh the page.");
   }

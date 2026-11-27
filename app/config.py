@@ -48,9 +48,19 @@ MAX_AUDIO_BYTES = 20 * 1024 * 1024
 CF_ACCESS_TEAM_DOMAIN = _env("CF_ACCESS_TEAM_DOMAIN").removeprefix("https://").rstrip("/")
 CF_ACCESS_AUD = _env("CF_ACCESS_AUD")
 
-# Optional "email=Name,email2=Name2" so the assistant greets people by name.
-USER_NAMES = dict(
-    (k.strip().lower(), v.strip())
-    for k, _, v in (pair.partition("=") for pair in _env("USER_NAMES").split(","))
-    if k.strip() and v.strip()
-)
+def _pairs(name: str) -> dict[str, str]:
+    """Parse "email=value,email2=value2"."""
+    return dict(
+        (k.strip().lower(), v.strip())
+        for k, _, v in (pair.partition("=") for pair in _env(name).split(","))
+        if k.strip() and v.strip()
+    )
+
+
+# How the assistant addresses people: "email=Name,email2=Name2".
+USER_NAMES = _pairs("USER_NAMES")
+# Optional per-person Grocy API keys ("email=key,..."), so Grocy's own journal shows who
+# made each change. People without one use GROCY_API_KEY.
+GROCY_USER_KEYS = _pairs("GROCY_USER_KEYS")
+# Address of Grocy as people open it in a browser, for the "Open Grocy" link.
+GROCY_PUBLIC_URL = _env("GROCY_PUBLIC_URL")

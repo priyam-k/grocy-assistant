@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -9,6 +10,11 @@ import httpx
 
 class GrocyError(Exception):
     pass
+
+
+# Who the current turn is acting for. Set per request task in main.py.
+actor_email: ContextVar[str] = ContextVar("actor_email", default="")
+actor_key: ContextVar[str] = ContextVar("actor_key", default="")
 
 
 def to_int(value: Any) -> int | None:
@@ -44,7 +50,8 @@ class Grocy:
 
     async def request(self, method: str, path: str, *, json: Any = None, params: Any = None) -> Any:
         try:
-            r = await self.http.request(method, path, json=json, params=params)
+            headers = {"GROCY-API-KEY": actor_key.get()} if actor_key.get() else None
+            r = await self.http.request(method, path, json=json, params=params, headers=headers)
         except httpx.HTTPError as e:
             raise GrocyError(f"Could not reach Grocy ({type(e).__name__})") from e
         if r.status_code >= 400:

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
-from .grocy import Catalog, Grocy, GrocyError, fmt_num, to_float, to_int
+from .grocy import Catalog, Grocy, GrocyError, actor_email, fmt_num, to_float, to_int
 
 NEVER = "2999-12-31"
 
@@ -438,6 +438,14 @@ def nice_date(iso: str | None) -> str:
     except ValueError:
         return iso
     return dt.strftime("%b %-d") if dt.year == date.today().year else dt.strftime("%b %-d, %Y")
+
+
+def signed(note: str | None) -> str | None:
+    """Grocy books every API change under the API key's owner, so name the person in the note."""
+    who = actor_email.get()
+    if not who or who.endswith("@local"):
+        return note
+    return f"{note} (via Pantry: {who})" if note else f"via Pantry: {who}"
 
 
 def action(op: str, kind: str, title: str, detail: str, **args: Any) -> dict:
@@ -1127,7 +1135,7 @@ class Toolbox:
             await self.cat.refresh(force=True)
             extra = {"created_product_id": product_id}
         body = {"amount": amount, "transaction_type": "purchase", "best_before_date": best_before_date}
-        for key, value in (("price", price), ("location_id", location_id), ("shopping_location_id", store_id), ("purchased_date", purchased_date), ("note", note)):
+        for key, value in (("price", price), ("location_id", location_id), ("shopping_location_id", store_id), ("purchased_date", purchased_date), ("note", signed(note))):
             if value is not None:
                 body[key] = value
         rows = await self.g.post(f"/stock/products/{product_id}/add", body)
@@ -1151,6 +1159,8 @@ class Toolbox:
 
     async def x_inventory(self, product_id, new_amount, best_before_date, location_id) -> dict:
         body = {"new_amount": new_amount, "best_before_date": best_before_date}
+        if signed(None):
+            body["note"] = signed(None)
         if location_id:
             body["location_id"] = location_id
         rows = await self.g.post(f"/stock/products/{product_id}/inventory", body)
