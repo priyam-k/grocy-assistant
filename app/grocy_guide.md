@@ -109,15 +109,17 @@ Through this chat:
   conversions.
 - Shopping lists: several lists, add, change, tick off, move between lists, remove items, add
   everything that is low, overdue or expired, clear a list.
-- Recipes: read, create, rename, change instructions and servings, add or change ingredients,
-  cook (consume) for a number of servings, put missing ingredients on the list.
-- Meal plan: read, add recipes, products or notes to a day and section, move, change, mark done.
-- Tasks: add, edit, assign, complete, reopen. Chores: create, edit, retire, record or skip, undo.
+- Recipes: read, create, rename, change instructions and servings, add, change or remove
+  ingredients, cook (consume) for a number of servings, put missing ingredients on the list,
+  delete a recipe.
+- Meal plan: read, add recipes, products or notes to a day and section, move, change, mark done,
+  remove entries.
+- Tasks: add, edit, assign, complete, reopen, delete. Chores: create, edit, retire, record or skip, undo.
 - Batteries: list and record charges. Calendar: everything dated in a period.
 - Lists Grocy is organised by: create and rename locations, stores, units, product groups,
   shopping lists, meal plan sections, task categories, batteries, equipment.
 
-Only in Grocy itself: deleting anything other than shopping list items (products, recipes, recipe
-ingredients, meal plan entries, tasks, chores), merging products, product pictures, scanning with
+Only in Grocy itself: deleting products, chores, locations, stores, units, groups or lists,
+merging products, product pictures, scanning with
 the camera, manuals for equipment, userfields, users and permissions, settings and feature flags,
 printing.

@@ -52,6 +52,9 @@ class FakeGrocy:
             **{name: list(rows.values()) for name, rows in self.rows.items()},
         }
         if m := re.fullmatch(r"/objects/(\w+)/(\d+)", path):
+            if request.method == "DELETE" and m[1] in self.rows:
+                del self.rows[m[1]][int(m[2])]
+                return ok()
             if request.method == "GET":
                 return ok(self.rows[m[1]][int(m[2])])
             if request.method == "PUT" and m[1] in self.rows:
@@ -209,6 +212,28 @@ def test_items_go_to_the_named_list_and_tasks_can_be_edited(world):
         world.fake.rows["task_categories"] = {}
         edit = await world.toolbox.plan("update_task", {"task_id": 1, "name": "Fix kitchen tap", "due_date": "2026-12-01"})
         assert (await world.toolbox.execute(edit[0]))["ok"] and world.fake.rows["tasks"][1]["due_date"] == "2026-12-01"
+
+    run(go())
+
+
+def test_removals_are_gated_and_limited(world):
+    from app.tools import BY_NAME
+
+    async def go():
+        assert all(BY_NAME[n].kind == "gated" for n in ("remove_tasks", "remove_meal_plan_entries", "delete_recipe", "update_recipe"))
+        world.fake.rows["meal_plan"] = {}
+        gone = await world.toolbox.plan("remove_tasks", {"task_ids": [1]})
+        assert (await world.toolbox.execute(gone[0]))["ok"] and not world.fake.rows["tasks"]
+        # the generic delete refuses anything but meal plan entries and tasks
+        refused = await world.toolbox.execute({"op": "delete_row", "args": {"entity": "products", "row_id": 1, "summary": ""}})
+        assert not refused["ok"] and 1 in world.fake.products
+        with pytest.raises(ToolError, match="no ingredients"):
+            await world.toolbox.plan("update_recipe", {"recipe_id": 1, "remove_product_ids": [2]})
+        swap = await world.toolbox.plan("update_recipe", {"recipe_id": 1, "ingredients": [{"product_id": 1, "amount": 1}], "remove_product_ids": [2]})
+        assert (await world.toolbox.execute(swap[0]))["ok"]
+        assert [r["product_id"] for r in world.fake.rows["recipes_pos"].values()] == [1]
+        delete = await world.toolbox.plan("delete_recipe", {"recipe_id": 1})
+        assert (await world.toolbox.execute(delete[0]))["ok"] and not world.fake.rows["recipes"] and not world.fake.rows["recipes_pos"]
 
     run(go())
 

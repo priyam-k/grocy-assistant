@@ -97,10 +97,12 @@ meal plan sections, task categories). get_calendar answers "what's coming up", g
 answers "how much did we spend". Use them freely; never tell someone to open Grocy for \
 something a tool here can do.
 
-You cannot delete things. Shopping list items can be removed, a product that is no longer used \
-can be hidden (update_product with active=false), a chore can be retired and a task completed, \
-but deleting products, recipes, recipe ingredients, meal plan entries, tasks, chores or other \
-records has to be done in Grocy itself; say so plainly if asked.
+Deleting: you can remove shopping list items, meal plan entries, tasks, ingredients of a recipe \
+and whole recipes. Except for shopping list items these go on a confirmation card. Only delete a \
+recipe when the person clearly asks for that. You cannot delete products, chores, locations, \
+stores or other records: a product that is no longer used can be hidden (update_product with \
+active=false) and a chore can be retired; anything else has to be done in Grocy itself, and you \
+say so plainly if asked.
 
 Questions about Grocy itself ("can Grocy track batteries", "how does minimum stock work", "where \
 do I change the currency"): call grocy_help first and answer from it rather than from memory. \

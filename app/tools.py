@@ -451,10 +451,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "update_recipe",
-        "Edit a saved recipe: rename it, change the instructions or servings, and add or change "
-        "ingredients. Each given ingredient is matched by product: one already in the recipe is "
-        "changed, a new one is added, the others stay as they are. Ingredients cannot be removed "
-        "here; that has to be done in Grocy. The user confirms.",
+        "Edit a saved recipe: rename it, change the instructions or servings, and add, change or "
+        "remove ingredients. Each given ingredient is matched by product: one already in the recipe "
+        "is changed, a new one is added, the others stay as they are. remove_product_ids takes "
+        "ingredients out. The user confirms.",
         obj(
             {
                 "recipe_id": INT,
@@ -462,10 +462,20 @@ TOOLS: list[Tool] = [
                 "instructions": d(STR, "Plain text, one step per line."),
                 "servings": INT,
                 "ingredients": INGREDIENTS,
+                "remove_product_ids": {"type": "array", "items": INT, "description": "Products to take out of the ingredient list."},
             },
             ["recipe_id"],
         ),
         "Preparing recipe change",
+        "gated",
+        "FEATURE_FLAG_RECIPES",
+    ),
+    Tool(
+        "delete_recipe",
+        "Delete a saved recipe for good, with its ingredient list. Only when the user clearly asks to "
+        "delete it. The user confirms.",
+        obj({"recipe_id": INT}, ["recipe_id"]),
+        "Preparing to delete recipe",
         "gated",
         "FEATURE_FLAG_RECIPES",
     ),
@@ -488,10 +498,18 @@ TOOLS: list[Tool] = [
     Tool(
         "update_meal_plan_entry",
         "Change a meal plan entry: move it to another day or section, change servings or the note, or "
-        "mark it done. Entries cannot be removed here. Runs immediately.",
+        "mark it done. Runs immediately.",
         obj({"entry_id": INT, "day": DATE, "servings": NUM, "section_id": INT, "note": STR, "done": BOOL}, ["entry_id"]),
         "Updating the meal plan",
         "auto",
+        "FEATURE_FLAG_RECIPES_MEALPLAN",
+    ),
+    Tool(
+        "remove_meal_plan_entries",
+        "Take entries off the meal plan by entry id (from get_meal_plan). The user confirms.",
+        obj({"entry_ids": arr(INT)}, ["entry_ids"]),
+        "Preparing meal plan change",
+        "gated",
         "FEATURE_FLAG_RECIPES_MEALPLAN",
     ),
     Tool(
@@ -573,6 +591,14 @@ TOOLS: list[Tool] = [
         obj({"task_id": INT}, ["task_id"]),
         "Completing task",
         "auto",
+        "FEATURE_FLAG_TASKS",
+    ),
+    Tool(
+        "remove_tasks",
+        "Delete tasks that are no longer wanted (for finished ones use complete_task). The user confirms.",
+        obj({"task_ids": arr(INT)}, ["task_ids"]),
+        "Preparing to remove tasks",
+        "gated",
         "FEATURE_FLAG_TASKS",
     ),
     Tool(
@@ -1669,13 +1695,47 @@ class Toolbox:
                 changed.append({"row_id": current[ing["product_id"]], **ing})
             else:
                 added.append(ing)
+        removed = []
+        for pid in inp.get("remove_product_ids") or []:
+            if to_int(pid) not in current:
+                raise ToolError(f"{self.cat.product_name(pid)} is not an ingredient of this recipe.")
+            if any(i["product_id"] == to_int(pid) for i in changed):
+                raise ToolError("The same product is in both ingredients and remove_product_ids.")
+            removed.append(current[to_int(pid)])
+        if removed and len(removed) == len(current) and not added:
+            raise ToolError("That would leave the recipe with no ingredients.")
         if changed:
             changes.append("change " + self.ingredient_text(changed))
         if added:
             changes.append("add " + self.ingredient_text(added))
+        if removed:
+            changes.append("remove " + ", ".join(self.cat.product_name(pid) for pid, row in current.items() if row in removed))
         if not changes:
             raise ToolError("No changes were given.")
-        return [action("update_recipe", "edit", recipe["name"], cap("; ".join(changes)), recipe_id=int(recipe["id"]), fields=fields, changed=changed, added=added)]
+        return [action("update_recipe", "edit", recipe["name"], cap("; ".join(changes)), recipe_id=int(recipe["id"]), fields=fields, changed=changed, added=added, removed=removed)]
+
+    async def p_delete_recipe(self, inp: dict) -> list[dict]:
+        recipe = await self.recipe(inp.get("recipe_id"))
+        planned = await self.g.objects("meal_plan", [f"recipe_id={recipe['id']}", f"day>={self.today().isoformat()}"])
+        if planned:
+            days = ", ".join(nice_date(r["day"]) for r in planned[:5])
+            raise ToolError(f"{recipe['name']} is still on the meal plan ({days}). Take it off the plan first, or tell the user.")
+        positions = [to_int(r["id"]) for r in await self.g.objects("recipes_pos", [f"recipe_id={recipe['id']}"])]
+        return [action("delete_recipe", "remove", recipe["name"], f"Delete this recipe and its {len(positions)} ingredients for good", recipe_id=int(recipe["id"]), positions=positions)]
+
+    async def p_remove_meal_plan_entries(self, inp: dict) -> list[dict]:
+        out = []
+        for entry_id in inp.get("entry_ids") or []:
+            row = await self.need_row("meal_plan", entry_id, "meal plan entry")
+            out.append(action("delete_row", "remove", await self.meal_title(row), f"Take off the plan for {nice_date(row['day'])}", entity="meal_plan", row_id=to_int(row["id"]), summary="Meal plan entry removed"))
+        return out
+
+    async def p_remove_tasks(self, inp: dict) -> list[dict]:
+        out = []
+        for task_id in inp.get("task_ids") or []:
+            task = await self.need_row("tasks", task_id, "task")
+            out.append(action("delete_row", "remove", task["name"], "Delete this task", entity="tasks", row_id=to_int(task["id"]), summary="Task deleted"))
+        return out
 
     async def need_section(self, section_id: Any) -> tuple[int, str]:
         sections = await self.sections()
@@ -2006,7 +2066,24 @@ class Toolbox:
         await self.g.put(f"/objects/{entity}/{row_id}", body)
         return {"summary": summary}
 
-    async def x_update_recipe(self, recipe_id, fields, changed, added) -> dict:
+    # Only ever reached from a confirmation card the user approved (see the gated tools above).
+    DELETABLE = {"meal_plan", "tasks"}
+
+    async def x_delete_row(self, entity, row_id, summary) -> dict:
+        if entity not in self.DELETABLE:
+            raise GrocyError(f"Deleting {entity} is not allowed here.")
+        await self.g.request("DELETE", f"/objects/{entity}/{row_id}")
+        return {"summary": summary}
+
+    async def x_delete_recipe(self, recipe_id, positions) -> dict:
+        for row_id in positions:
+            await self.g.request("DELETE", f"/objects/recipes_pos/{row_id}")
+        await self.g.request("DELETE", f"/objects/recipes/{recipe_id}")
+        return {"summary": "Recipe deleted"}
+
+    async def x_update_recipe(self, recipe_id, fields, changed, added, removed=()) -> dict:
+        for row_id in removed:
+            await self.g.request("DELETE", f"/objects/recipes_pos/{row_id}")
         if fields:
             await self.g.put(f"/objects/recipes/{recipe_id}", fields)
         for ing in changed:
