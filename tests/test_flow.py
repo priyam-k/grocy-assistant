@@ -154,6 +154,15 @@ def test_consume_all_and_clamping(world):
     run(go())
 
 
+def test_grocy_help_returns_guide_and_local_setup(world):
+    async def go():
+        help_ = await world.toolbox.read("grocy_help", {})
+        assert "Minimum stock amount" in help_["guide"]
+        assert "CHORES" in help_["this_household"]["features_switched_off"]
+
+    run(go())
+
+
 def test_search_handles_typos(world):
     async def go():
         found = await world.toolbox.read("search_products", {"query": "fenel seed"})

@@ -8,6 +8,8 @@ updates a self-hosted [Grocy](https://grocy.info) for them.
 - `app/main.py`: FastAPI. Serves the page and streams each assistant turn over SSE.
 - `app/agent.py`: manual tool-use loop on the Anthropic Messages API (streaming, prompt caching).
 - `app/tools.py`: the tools, thin wrappers over Grocy's REST API.
+- `app/grocy_guide.md`: reference text about Grocy's own features, returned by the `grocy_help`
+  tool so the assistant can answer "can Grocy do X" and "where do I find Y".
 - `app/grocy.py`: Grocy client and a cached copy of products, units, locations and stores.
 - `app/db.py`: SQLite in `data/` for conversations, what the UI shows, and usage counts.
 - `static/`: plain HTML/CSS/JS, no build step.

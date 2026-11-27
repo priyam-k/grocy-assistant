@@ -11,9 +11,12 @@ import difflib
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 from .grocy import Catalog, Grocy, GrocyError, actor_email, fmt_num, to_float, to_int
+
+GUIDE = (Path(__file__).parent / "grocy_guide.md").read_text()
 
 NEVER = "2999-12-31"
 
@@ -116,6 +119,15 @@ TOOLS: list[Tool] = [
         "Fresh list of locations, quantity units, stores, product groups or shopping lists.",
         obj({"kind": {"type": "string", "enum": ["locations", "quantity_units", "stores", "product_groups", "shopping_lists"]}}, ["kind"]),
         "Checking Grocy settings",
+    ),
+    Tool(
+        "grocy_help",
+        "Reference guide to Grocy itself: what its features are, how they work and where to find them "
+        "in Grocy's menus, plus this household's Grocy version and which features are switched on. "
+        "Call this before answering any question about Grocy as an app (\"can Grocy do X\", \"how do "
+        "minimum stock amounts work\", \"where do I change Y\") instead of answering from memory.",
+        obj({}),
+        "Reading the Grocy guide",
     ),
     Tool(
         "add_purchases",
@@ -696,6 +708,22 @@ class Toolbox:
         if source is None:
             raise ToolError("Unknown kind.")
         return [{"id": i, "name": r["name"]} for i, r in sorted(source.items())] or "None yet."
+
+    async def r_grocy_help(self, inp: dict) -> Any:
+        try:
+            info = await self.g.get("/system/info") or {}
+            version = (info.get("grocy_version") or {}).get("Version") or "unknown"
+        except GrocyError:
+            version = "unknown"
+        flags = {k: bool(v) for k, v in sorted(self.cat.config.items()) if k.startswith("FEATURE_FLAG_")}
+        return {
+            "this_household": {
+                "grocy_version": version,
+                "currency": self.cat.currency,
+                "features_switched_off": [k.removeprefix("FEATURE_FLAG_") for k, on in flags.items() if not on] or "none",
+            },
+            "guide": GUIDE,
+        }
 
     async def r_get_recipes(self, inp: dict) -> Any:
         rid = to_int(inp.get("recipe_id"))
