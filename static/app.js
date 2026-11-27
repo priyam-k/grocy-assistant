@@ -382,155 +382,289 @@ function renderPreviews() {
 }
 
 // -------------------------------------------------------------------- voice
+//
+// Listening happens inside the message box: words appear as they are recognised, a small
+// meter shows the microphone level, and ✓ sends while ✕ throws the recording away.
+// The microphone is opened when the mic button is tapped and fully released (tracks
+// stopped, audio context closed) the moment listening ends, whatever the reason.
+//
+// Three engines, picked by the server: "deepgram" streams audio and shows live words;
+// "server" records and transcribes after ✓; "browser" uses the phone's own recognition.
 
-const voice = { stream: null, recorder: null, chunks: [], ctx: null, analyser: null, raf: 0, heard: false, lastSound: 0, started: 0, cancelled: false, recognition: null };
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const canRecord = !!(navigator.mediaDevices && window.MediaRecorder);
+const canCapture = !!(navigator.mediaDevices && (window.AudioContext || window.webkitAudioContext));
+const voice = { active: false, finishing: false };
 
-function showRecorder(on, status) {
-  $("recorder").hidden = !on;
-  $("composer").hidden = on;
-  if (status) $("rec-status").textContent = status;
+const TAP_WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  constructor() { super(); this.parts = []; this.size = 0; }
+  process(inputs) {
+    const channel = inputs[0][0];
+    if (channel) {
+      this.parts.push(channel.slice());
+      this.size += channel.length;
+      if (this.size >= 2048) {
+        const out = new Float32Array(this.size);
+        let at = 0;
+        for (const part of this.parts) { out.set(part, at); at += part.length; }
+        this.port.postMessage(out, [out.buffer]);
+        this.parts = []; this.size = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("tap", Tap);`;
+
+function canTalk() {
+  return state.stt === "browser" ? !!SpeechRecognition : canCapture;
+}
+
+function joinText(a, b) {
+  return [a.trim(), b.trim()].filter(Boolean).join(" ");
+}
+
+function setListening(on, hint) {
+  voice.active = on;
+  $("composer").classList.toggle("listening", on);
+  input.readOnly = on;
+  input.placeholder = on ? hint || "Listening…" : "What did you buy or use?";
+  $("wave").hidden = !on || voice.engine === "browser";
+  $("rec-cancel").hidden = $("rec-done").hidden = !on;
+  $("photo").hidden = on;
+  refreshComposer();
+}
+
+function showWords() {
+  input.value = joinText(voice.base, joinText(voice.finalText, voice.interim));
+  autosize();
+  input.scrollTop = input.scrollHeight;
 }
 
 async function startListening() {
-  if (state.busy || !$("recorder").hidden) return;
+  if (state.busy || voice.active) return;
   window.speechSynthesis?.cancel();
-  if (state.speak && window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(""));  // unlock on iOS
-  if (state.stt !== "server" || !canRecord) return startBrowserRecognition();
+  Object.assign(voice, {
+    engine: state.stt, finishing: false, base: input.value, finalText: "", interim: "",
+    heard: false, started: performance.now(), lastSound: performance.now(), levels: new Array(24).fill(0), chunks: [],
+  });
+  if (voice.engine === "browser") return startBrowserRecognition();
   try {
-    voice.stream = voice.stream || await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
   } catch {
-    toast("Please allow the microphone to talk to me.");
+    toast("Please allow the microphone so I can hear you.");
     return;
   }
-  const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
-  voice.recorder = new MediaRecorder(voice.stream, type ? { mimeType: type } : undefined);
-  voice.chunks = []; voice.heard = false; voice.cancelled = false;
-  voice.started = voice.lastSound = performance.now();
-  voice.recorder.ondataavailable = (e) => e.data.size && voice.chunks.push(e.data);
-  voice.recorder.onstop = finishRecording;
-  voice.recorder.start();
-  voice.ctx = voice.ctx || new (window.AudioContext || window.webkitAudioContext)();
-  await voice.ctx.resume();
-  voice.source = voice.ctx.createMediaStreamSource(voice.stream);
-  voice.analyser = voice.ctx.createAnalyser();
-  voice.analyser.fftSize = 1024;
-  voice.source.connect(voice.analyser);
-  showRecorder(true, "Listening… tap ✓ when you're done");
-  drawWave();
+  try {
+    voice.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await voice.ctx.resume();
+    const module = URL.createObjectURL(new Blob([TAP_WORKLET], { type: "application/javascript" }));
+    await voice.ctx.audioWorklet.addModule(module);
+    URL.revokeObjectURL(module);
+    voice.source = voice.ctx.createMediaStreamSource(voice.stream);
+    voice.node = new AudioWorkletNode(voice.ctx, "tap");
+    voice.node.port.onmessage = (e) => onAudio(e.data);
+    const mute = voice.ctx.createGain();
+    mute.gain.value = 0;
+    voice.source.connect(voice.node).connect(mute).connect(voice.ctx.destination);
+  } catch {
+    releaseMic();
+    toast("Talking isn't available in this browser.");
+    return;
+  }
+  if (voice.engine === "deepgram") {
+    const ws = (voice.ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/listen`));
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.error) { cancelListening(); toast(data.error); return; }
+      if (data.final) { voice.finalText = joinText(voice.finalText, data.text); voice.interim = ""; }
+      else voice.interim = data.text;
+      voice.heard = true;
+      if (voice.active) showWords();
+    };
+    ws.onclose = () => { voice.wsClosed = true; voice.onWsClose?.(); };
+    voice.wsClosed = false;
+  } else {
+    const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
+    voice.recorder = new MediaRecorder(voice.stream, type ? { mimeType: type } : undefined);
+    voice.recorder.ondataavailable = (e) => e.data.size && voice.chunks.push(e.data);
+    voice.recorder.start();
+  }
+  setListening(true);
+  drawMeter();
 }
 
-function drawWave() {
-  const canvas = $("wave"), g = canvas.getContext("2d"), data = new Uint8Array(voice.analyser.fftSize);
-  const bars = 48, levels = (drawWave.levels = drawWave.levels || new Array(bars).fill(0));
-  const color = getComputedStyle(document.documentElement).getPropertyValue("--accent");
-  const tick = () => {
-    if (!voice.recorder || voice.recorder.state !== "recording") return;
-    voice.analyser.getByteTimeDomainData(data);
-    let sum = 0;
-    for (const v of data) sum += (v - 128) * (v - 128);
-    const rms = Math.sqrt(sum / data.length) / 128;
-    const now = performance.now();
-    if (rms > 0.035) { voice.lastSound = now; if (now - voice.started > 250) voice.heard = true; }
-    levels.push(Math.min(1, rms * 6)); levels.shift();
+// Called with ~40 ms of microphone audio at a time.
+function onAudio(samples) {
+  let sum = 0;
+  for (const v of samples) sum += v * v;
+  const rms = Math.sqrt(sum / samples.length);
+  const now = performance.now();
+  if (rms > 0.02) { voice.lastSound = now; if (voice.engine !== "deepgram" && now - voice.started > 250) voice.heard = true; }
+  voice.level = Math.max(rms, (voice.level || 0) * 0.6);
+  const ws = voice.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN || voice.finishing) return;
+  // Deepgram gets 16 kHz 16-bit mono, whatever rate the phone records at.
+  const ratio = voice.ctx.sampleRate / 16000;
+  const out = new Int16Array(Math.floor(samples.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const from = Math.floor(i * ratio), to = Math.max(from + 1, Math.floor((i + 1) * ratio));
+    let total = 0;
+    for (let j = from; j < to; j++) total += samples[j];
+    out[i] = Math.max(-1, Math.min(1, total / (to - from))) * 0x7fff;
+  }
+  ws.send(out.buffer);
+}
+
+function drawMeter() {
+  const canvas = $("wave"), g = canvas.getContext("2d");
+  const color = getComputedStyle(document.documentElement).getPropertyValue("--muted");
+  let lastPush = 0;
+  const tick = (now) => {
+    if (!voice.active || voice.finishing) return;
+    if (now - lastPush > 70) { voice.levels.push(Math.min(1, (voice.level || 0) * 9)); voice.levels.shift(); lastPush = now; }
     g.clearRect(0, 0, canvas.width, canvas.height);
     g.fillStyle = color;
-    const w = canvas.width / bars;
-    levels.forEach((l, i) => { const h = Math.max(4, l * canvas.height); g.fillRect(i * w + w * 0.25, (canvas.height - h) / 2, w * 0.5, h); });
-    // Stop by itself after a pause, or give up if nothing was said.
-    if (voice.heard && now - voice.lastSound > 1900) return stopListening();
-    if (!voice.heard && now - voice.started > 9000) return stopListening(true);
-    if (now - voice.started > 90000) return stopListening();
+    const step = canvas.width / voice.levels.length;
+    voice.levels.forEach((level, i) => {
+      const h = Math.max(4, level * canvas.height), w = 4;
+      g.beginPath();
+      g.roundRect(i * step + (step - w) / 2, (canvas.height - h) / 2, w, h, 2);
+      g.fill();
+    });
+    const idle = performance.now() - voice.lastSound;
+    // Never leave the microphone open on a silent room.
+    if (!voice.heard && performance.now() - voice.started > 12000) { cancelListening(); toast("I didn't hear anything."); return; }
+    if (voice.heard && idle > 7000) { finishListening(false); return; }
     voice.raf = requestAnimationFrame(tick);
   };
-  tick();
-}
-
-function stopListening(cancel = false) {
-  if (voice.recognition) { voice.cancelled = cancel; voice.recognition.stop(); return; }
-  if (!voice.recorder || voice.recorder.state !== "recording") { showRecorder(false); return; }
-  voice.cancelled = cancel;
-  voice.recorder.stop();
+  voice.raf = requestAnimationFrame(tick);
 }
 
 function releaseMic() {
+  cancelAnimationFrame(voice.raf);
   voice.stream?.getTracks().forEach((t) => t.stop());
-  voice.stream = null;
+  try { voice.node?.disconnect(); voice.source?.disconnect(); } catch { /* already gone */ }
+  voice.ctx?.close().catch(() => {});
+  voice.stream = voice.node = voice.source = voice.ctx = null;
 }
 
-async function finishRecording() {
-  voice.source?.disconnect();
-  const type = voice.recorder.mimeType || "audio/webm";
-  const blob = new Blob(voice.chunks, { type });
+function cancelListening() {
+  if (!voice.active) return;
+  voice.finishing = true;
+  if (voice.recognition) { voice.cancelled = true; voice.recognition.abort(); }
+  if (voice.recorder && voice.recorder.state !== "inactive") { voice.recorder.onstop = null; voice.recorder.stop(); }
   voice.recorder = null;
-  if (voice.cancelled || !voice.heard) {
-    showRecorder(false); releaseMic();
-    if (!voice.cancelled) toast("I didn't hear anything.");
-    return;
-  }
-  showRecorder(true, "Writing down what you said…");
-  try {
-    const form = new FormData();
-    form.append("audio", blob, type.includes("mp4") ? "speech.m4a" : "speech.webm");
-    const r = await fetch("/api/transcribe", { method: "POST", body: form });
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.detail);
-    heard(body.text);
-  } catch (err) {
-    releaseMic();
-    toast(err.message || "I couldn't understand that. Please try again.");
-  } finally {
-    showRecorder(false);
-  }
+  voice.ws?.close();
+  voice.ws = null;
+  releaseMic();
+  input.value = voice.base;
+  autosize();
+  setListening(false);
 }
+
+// send=true: ✓ was tapped. send=false: stopped by itself; leave the words in the box.
+async function finishListening(send) {
+  if (!voice.active || voice.finishing) return;
+  voice.finishing = true;
+  if (voice.recognition) { voice.sendAfter = send; voice.recognition.stop(); return; }
+  let text = "";
+  if (voice.engine === "deepgram") {
+    releaseMic();
+    const ws = voice.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send("stop");  // the last words arrive, then the server closes the socket
+      await new Promise((done) => { voice.onWsClose = done; setTimeout(done, 2500); });
+    }
+    ws?.close();
+    voice.ws = null; voice.onWsClose = null;
+    text = joinText(voice.finalText, voice.interim);
+  } else {
+    const recorder = voice.recorder;
+    const blob = await new Promise((done) => {
+      recorder.onstop = () => done(new Blob(voice.chunks, { type: recorder.mimeType || "audio/webm" }));
+      recorder.stop();
+    });
+    voice.recorder = null;
+    releaseMic();
+    if (voice.heard) {
+      input.placeholder = "Writing down what you said…";
+      try {
+        const form = new FormData();
+        form.append("audio", blob, blob.type.includes("mp4") ? "speech.m4a" : "speech.webm");
+        const r = await fetch("/api/transcribe", { method: "POST", body: form });
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.detail);
+        text = body.text;
+      } catch (err) {
+        toast(err.message || "I couldn't understand that. Please try again.");
+      }
+    }
+  }
+  deliver(text, send);
+}
+
+function deliver(text, send) {
+  const spokenOnly = !voice.base.trim();
+  input.value = joinText(voice.base, text);
+  autosize();
+  setListening(false);
+  if (!text.trim()) { toast("I didn't catch that."); return; }
+  if (!send) { input.focus(); return; }
+  if (spokenOnly) heard(text); else send_(input.value);
+}
+const send_ = (text) => send(text, { voice: true });
 
 function startBrowserRecognition() {
-  if (!SpeechRecognition) { toast("Talking isn't available in this browser."); return; }
   const rec = (voice.recognition = new SpeechRecognition());
   rec.lang = navigator.language || "en-US";
   rec.interimResults = true;
-  let finalText = "";
-  voice.cancelled = false;
+  rec.continuous = true;
+  voice.cancelled = false; voice.sendAfter = false;
   rec.onresult = (e) => {
-    finalText = [...e.results].map((r) => r[0].transcript).join(" ");
-    $("rec-status").textContent = finalText;
+    voice.finalText = [...e.results].map((r) => r[0].transcript).join(" ");
+    if (voice.active && !voice.cancelled) showWords();
   };
-  rec.onerror = (e) => { if (e.error === "not-allowed") toast("Please allow the microphone to talk to me."); };
+  rec.onerror = (e) => { if (e.error === "not-allowed" || e.error === "service-not-allowed") toast("Please allow the microphone so I can hear you."); };
   rec.onend = () => {
     voice.recognition = null;
-    showRecorder(false);
-    if (!voice.cancelled && finalText.trim()) heard(finalText);
+    if (voice.cancelled) return;
+    deliver(voice.finalText, voice.sendAfter);
   };
-  showRecorder(true, "Listening…");
-  $("wave").getContext("2d").clearRect(0, 0, 600, 80);
-  rec.start();
+  setListening(true);
+  try { rec.start(); } catch { voice.recognition = null; setListening(false); toast("Talking isn't available right now."); }
 }
 
-const YES = /^(yes|yeah|yep|yup|ok|okay|sure|correct|right|confirm|save|do it|go ahead|looks good|haan|han|ha|theek hai|thik hai)\b/i;
-const NO = /^(no|nope|nah|cancel|stop|wrong|don't|do not|nahi|nahin)\b/i;
+const YES = /^(yes|yeah|yep|yup|ok|okay|sure|correct|right|confirm|save|do it|go ahead|looks good|haan|han|ha|theek hai|thik hai|हाँ|हां|ठीक है)(\s|[.!,]|$)/i;
+const NO = /^(no|nope|nah|cancel|stop|wrong|don't|do not|nahi|nahin|नहीं)(\s|[.!,]|$)/i;
 
+// A spoken message with nothing typed around it. A short yes/no answers a waiting card.
 function heard(text) {
-  text = (text || "").trim();
-  if (!text) { releaseMic(); toast("I didn't catch that."); return; }
   const short = text.split(/\s+/).length <= 4, card = state.pendingCard;
-  if (card && short && YES.test(text)) { showUser({ text, voice: true }); state.voiceTurn = true; return confirmCard(card, card.allIds); }
-  if (card && short && NO.test(text)) { showUser({ text, voice: true }); state.voiceTurn = true; return confirmCard(card, []); }
+  if (card && short && (YES.test(text) || NO.test(text))) {
+    input.value = ""; autosize(); refreshComposer();
+    showUser({ text, voice: true });
+    state.voiceTurn = true;
+    return confirmCard(card, YES.test(text) ? card.allIds : []);
+  }
   send(text, { voice: true });
 }
 
-// After a spoken turn with "read aloud" on: say the reply, then listen again.
+// After a spoken turn with "read replies aloud" on, say the reply. The microphone stays off.
 function afterTurn() {
   if (!state.voiceTurn) return;
   state.voiceTurn = false;
   const text = state.turnText.replace(/[*_`#]/g, "").replace(/\s+/g, " ").trim();
-  if (!state.speak || !window.speechSynthesis || !text) { releaseMic(); return; }
+  if (!state.speak || !window.speechSynthesis || !text) return;
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = navigator.language || "en-US";
-  utterance.onend = () => { if (state.speak && !state.busy) startListening(); };
-  utterance.onerror = releaseMic;
   speechSynthesis.speak(utterance);
 }
+
+// Leaving the page or locking the phone always ends listening and frees the microphone.
+document.addEventListener("visibilitychange", () => { if (document.hidden) cancelListening(); });
+window.addEventListener("pagehide", cancelListening);
 
 // ----------------------------------------------------------------- composer
 
@@ -541,9 +675,9 @@ function autosize() {
 
 function refreshComposer() {
   const hasContent = input.value.trim() || state.images.length;
-  const canTalk = (state.stt === "server" && canRecord) || !!SpeechRecognition;
-  $("send").hidden = !hasContent && canTalk;
-  $("mic").hidden = !!hasContent || !canTalk;
+  const talk = canTalk();
+  $("send").hidden = voice.active || (!hasContent && talk);
+  $("mic").hidden = voice.active || !!hasContent || !talk;
   $("send").disabled = state.busy;
 }
 
@@ -551,17 +685,18 @@ input.addEventListener("input", () => { autosize(); refreshComposer(); });
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer: fine)").matches) { e.preventDefault(); send(input.value); }
 });
-$("composer").addEventListener("submit", (e) => { e.preventDefault(); send(input.value); });
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); if (!voice.active) send(input.value); });
 $("photo").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
 $("mic").addEventListener("click", startListening);
-$("rec-done").addEventListener("click", () => stopListening(false));
-$("rec-cancel").addEventListener("click", () => { stopListening(true); releaseMic(); });
+$("rec-done").addEventListener("click", () => finishListening(true));
+$("rec-cancel").addEventListener("click", cancelListening);
 $("speak-toggle").addEventListener("click", () => {
   state.speak = !state.speak;
   localStorage.setItem("speak", state.speak ? "1" : "0");
   $("speak-toggle").setAttribute("aria-checked", state.speak);
   if (!state.speak) window.speechSynthesis?.cancel();
+  else if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(""));  // iOS needs a tap to allow speech
   toast(state.speak ? "When you talk to me, I'll answer out loud." : "I'll stay quiet.");
 });
 // ------------------------------------------------------- menu and history

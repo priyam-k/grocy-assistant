@@ -15,10 +15,13 @@ from zoneinfo import ZoneInfo
 import anthropic
 import httpx
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from urllib.parse import urlencode
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import InvalidStatus
 
 from . import config
 from .agent import Agent, Emit
@@ -82,9 +85,13 @@ class User(BaseModel):
 
 
 async def current_user(request: Request) -> User:
-    email = request.headers.get("cf-access-authenticated-user-email", "").strip().lower()
+    return await identify(request.headers)
+
+
+async def identify(headers) -> User:
+    email = headers.get("cf-access-authenticated-user-email", "").strip().lower()
     if S.jwks:
-        token = request.headers.get("cf-access-jwt-assertion", "")
+        token = headers.get("cf-access-jwt-assertion", "")
         try:
             key = await asyncio.to_thread(S.jwks.get_signing_key_from_jwt, token)
             claims = jwt.decode(
@@ -180,7 +187,7 @@ async def state(user: User = Depends(current_user)):
     conv = S.db.latest(user.email, config.IDLE_HOURS * 3600)
     return {
         "user": user.model_dump(),
-        "stt": "server" if config.STT_API_KEY else "browser",
+        "stt": "deepgram" if config.DEEPGRAM_API_KEY else "server" if config.STT_API_KEY else "browser",
         "grocy_url": config.GROCY_PUBLIC_URL,
         "history": S.db.history(user.email),
         "conversation": {"id": conv.id, "items": S.db.shown(conv.id)} if conv else None,
@@ -317,6 +324,80 @@ async def transcribe(audio: UploadFile = File(...), user: User = Depends(current
     except httpx.HTTPError:
         raise HTTPException(502, "I couldn't reach the transcription service. Please try again.")
     return {"text": str(r.json().get("text", "")).strip()}
+
+
+@app.websocket("/api/listen")
+async def listen(ws: WebSocket):
+    """Live transcription: the page sends 16 kHz PCM, we relay it to Deepgram and pass the words back.
+
+    The Deepgram key never leaves the server. The page sends the text "stop" when the person is
+    done; Deepgram then flushes its last words and closes, which ends the relay.
+    """
+    try:
+        await identify(ws.headers)
+    except HTTPException:
+        await ws.close(code=4401)
+        return
+    if not config.DEEPGRAM_API_KEY:
+        await ws.close(code=4404)
+        return
+    await ws.accept()
+    base = [
+        ("model", config.DEEPGRAM_MODEL), ("language", config.DEEPGRAM_LANGUAGE),
+        ("encoding", "linear16"), ("sample_rate", "16000"), ("channels", "1"),
+        ("interim_results", "true"), ("smart_format", "true"), ("endpointing", "300"),
+    ]
+    # Product names as key terms, so "paneer" and "ghee" are not misheard.
+    terms = [("keyterm", p["name"]) for p in list(S.catalog.products.values())[:100]]
+    headers = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
+
+    async def relay(params: list[tuple[str, str]]) -> None:
+        async with ws_connect("wss://api.deepgram.com/v1/listen?" + urlencode(params), additional_headers=headers, open_timeout=8) as dg:
+            async def upstream() -> None:
+                try:
+                    while True:
+                        message = await ws.receive()
+                        if message["type"] == "websocket.disconnect" or message.get("text") == "stop":
+                            break
+                        if message.get("bytes"):
+                            await dg.send(message["bytes"])
+                finally:
+                    await dg.send(json.dumps({"type": "CloseStream"}))
+
+            async def downstream() -> None:
+                async for raw in dg:
+                    data = json.loads(raw) if isinstance(raw, str) else {}
+                    if data.get("type") != "Results":
+                        continue
+                    text = data["channel"]["alternatives"][0].get("transcript", "")
+                    if text:
+                        await ws.send_json({"text": text, "final": bool(data.get("is_final"))})
+
+            sender = asyncio.create_task(upstream())
+            try:
+                await asyncio.wait_for(downstream(), timeout=180)
+            finally:
+                sender.cancel()
+
+    try:
+        try:
+            await relay(base + terms)
+        except InvalidStatus as e:
+            if not terms or e.response.status_code != 400:
+                raise
+            log.warning("Deepgram refused the request with key terms (%s); retrying without", e.response.status_code)
+            await relay(base)
+    except Exception as e:
+        log.error("Live transcription failed: %s: %s", type(e).__name__, e)
+        try:
+            await ws.send_json({"error": "I couldn't start listening. Please try again."})
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.get("/api/uploads/{name}")

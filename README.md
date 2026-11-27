@@ -28,8 +28,18 @@ Things worth knowing before changing it:
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` and `GROCY_API_KEY` (Grocy: wrench
-menu, Manage API keys). Voice transcription needs `STT_API_KEY` for any OpenAI-compatible
-`/audio/transcriptions` endpoint; without it the page uses the phone's built-in recognition.
+menu, Manage API keys).
+
+Voice has three engines, picked by which key is set:
+
+- `DEEPGRAM_API_KEY`: live transcription. The page streams 16 kHz audio over `/api/listen`, the
+  server relays it to Deepgram, and words appear while the person speaks. `DEEPGRAM_LANGUAGE=multi`
+  handles Hindi and English in one sentence. Product names are sent as key terms.
+- `STT_API_KEY`: any OpenAI-compatible `/audio/transcriptions` endpoint. Words appear after ✓.
+- Neither: the phone's built-in speech recognition.
+
+The microphone is opened on tap and released as soon as listening ends, including when the page is
+hidden or the phone is locked.
 
 Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `yourteam.cloudflareaccess.com`) and `CF_ACCESS_AUD` (the
 Application Audience tag of the Access app) so every request's Access token is verified. Without

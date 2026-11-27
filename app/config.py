@@ -30,6 +30,11 @@ STT_BASE_URL = _env("STT_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"
 STT_MODEL = _env("STT_MODEL", "whisper-large-v3-turbo")
 STT_LANGUAGE = _env("STT_LANGUAGE", "en")
 
+# Deepgram live transcription (words appear while speaking). Takes priority over STT_* when set.
+DEEPGRAM_API_KEY = _env("DEEPGRAM_API_KEY")
+DEEPGRAM_MODEL = _env("DEEPGRAM_MODEL", "nova-3")
+DEEPGRAM_LANGUAGE = _env("DEEPGRAM_LANGUAGE", "multi")  # "multi" handles Hindi and English mixed
+
 DATA_DIR = Path(_env("DATA_DIR", "./data")).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "assistant.db"
