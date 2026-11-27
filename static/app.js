@@ -395,27 +395,6 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 const canCapture = !!(navigator.mediaDevices && (window.AudioContext || window.webkitAudioContext));
 const voice = { active: false, finishing: false };
 
-const TAP_WORKLET = `
-class Tap extends AudioWorkletProcessor {
-  constructor() { super(); this.parts = []; this.size = 0; }
-  process(inputs) {
-    const channel = inputs[0][0];
-    if (channel) {
-      this.parts.push(channel.slice());
-      this.size += channel.length;
-      if (this.size >= 2048) {
-        const out = new Float32Array(this.size);
-        let at = 0;
-        for (const part of this.parts) { out.set(part, at); at += part.length; }
-        this.port.postMessage(out, [out.buffer]);
-        this.parts = []; this.size = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor("tap", Tap);`;
-
 function canTalk() {
   return state.stt === "browser" ? !!SpeechRecognition : canCapture;
 }
@@ -441,37 +420,74 @@ function showWords() {
   input.scrollTop = input.scrollHeight;
 }
 
+// Tell the server when voice fails on a device, so it shows up in the logs.
+function reportVoice(step, err) {
+  const detail = `${step}: ${err && (err.name || "")} ${err && (err.message || err)}`.slice(0, 300);
+  fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: detail }) }).catch(() => {});
+}
+
+const within = (promise, ms) => Promise.race([promise, new Promise((done) => setTimeout(done, ms))]);
+
 async function startListening() {
   if (state.busy || voice.active) return;
   window.speechSynthesis?.cancel();
   Object.assign(voice, {
-    engine: state.stt, finishing: false, base: input.value, finalText: "", interim: "",
-    heard: false, started: performance.now(), lastSound: performance.now(), levels: new Array(24).fill(0), chunks: [],
+    engine: state.stt, finishing: false, ready: false, base: input.value, finalText: "", interim: "",
+    heard: false, gotAudio: false, started: performance.now(), lastSound: performance.now(), levels: new Array(24).fill(0), chunks: [], level: 0,
   });
   if (voice.engine === "browser") return startBrowserRecognition();
-  try {
-    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
-  } catch {
-    toast("Please allow the microphone so I can hear you.");
-    return;
-  }
+
+  // iOS only lets audio start from inside the tap itself, so the audio context is created
+  // and started here, before anything is awaited. Asking for the microphone comes after.
   try {
     voice.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    await voice.ctx.resume();
-    const module = URL.createObjectURL(new Blob([TAP_WORKLET], { type: "application/javascript" }));
-    await voice.ctx.audioWorklet.addModule(module);
-    URL.revokeObjectURL(module);
-    voice.source = voice.ctx.createMediaStreamSource(voice.stream);
-    voice.node = new AudioWorkletNode(voice.ctx, "tap");
-    voice.node.port.onmessage = (e) => onAudio(e.data);
-    const mute = voice.ctx.createGain();
-    mute.gain.value = 0;
-    voice.source.connect(voice.node).connect(mute).connect(voice.ctx.destination);
-  } catch {
-    releaseMic();
+    voice.ctx.resume().catch(() => {});
+  } catch (err) {
+    reportVoice("audio-context", err);
     toast("Talking isn't available in this browser.");
     return;
   }
+  setListening(true, "Starting…");
+  const attempt = (voice.attempt = (voice.attempt || 0) + 1);
+  const stale = () => !voice.active || voice.attempt !== attempt;
+
+  try {
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (err) {
+    if (stale()) return;
+    reportVoice("microphone", err);
+    cancelListening();
+    toast(err && err.name === "NotAllowedError" ? "Please allow the microphone so I can hear you." : "I couldn't open the microphone.");
+    return;
+  }
+  if (stale()) { voice.stream.getTracks().forEach((t) => t.stop()); return; }
+
+  try {
+    await within(voice.ctx.resume(), 1500);
+    voice.source = voice.ctx.createMediaStreamSource(voice.stream);
+    const mute = voice.ctx.createGain();
+    mute.gain.value = 0;
+    try {
+      await voice.ctx.audioWorklet.addModule("/static/tap-worklet.js");
+      voice.node = new AudioWorkletNode(voice.ctx, "tap");
+      voice.node.port.onmessage = (e) => onAudio(e.data);
+    } catch (err) {
+      // Older browsers: the deprecated but universal way of reading microphone audio.
+      reportVoice("worklet-fallback", err);
+      voice.node = voice.ctx.createScriptProcessor(2048, 1, 1);
+      voice.node.onaudioprocess = (e) => onAudio(new Float32Array(e.inputBuffer.getChannelData(0)));
+    }
+    voice.source.connect(voice.node);
+    voice.node.connect(mute);
+    mute.connect(voice.ctx.destination);
+  } catch (err) {
+    reportVoice("audio-setup", err);
+    cancelListening();
+    toast("Talking isn't working on this device right now.");
+    return;
+  }
+  if (stale()) return;
+
   if (voice.engine === "deepgram") {
     const ws = (voice.ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/listen`));
     ws.binaryType = "arraybuffer";
@@ -483,7 +499,13 @@ async function startListening() {
       voice.heard = true;
       if (voice.active) showWords();
     };
-    ws.onclose = () => { voice.wsClosed = true; voice.onWsClose?.(); };
+    ws.onerror = () => reportVoice("websocket", "connection error");
+    ws.onclose = () => {
+      voice.wsClosed = true;
+      voice.onWsClose?.();
+      // Dropped while still listening: keep what was heard instead of pretending to listen.
+      if (voice.active && !voice.finishing && voice.ws === ws) finishListening(false);
+    };
     voice.wsClosed = false;
   } else {
     const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
@@ -491,12 +513,15 @@ async function startListening() {
     voice.recorder.ondataavailable = (e) => e.data.size && voice.chunks.push(e.data);
     voice.recorder.start();
   }
-  setListening(true);
+  voice.ready = true;
+  voice.started = voice.lastSound = performance.now();
+  input.placeholder = "Listening…";
   drawMeter();
 }
 
 // Called with ~40 ms of microphone audio at a time.
 function onAudio(samples) {
+  voice.gotAudio = true;
   let sum = 0;
   for (const v of samples) sum += v * v;
   const rms = Math.sqrt(sum / samples.length);
@@ -530,11 +555,13 @@ function drawMeter() {
     voice.levels.forEach((level, i) => {
       const h = Math.max(4, level * canvas.height), w = 4;
       g.beginPath();
-      g.roundRect(i * step + (step - w) / 2, (canvas.height - h) / 2, w, h, 2);
+      if (g.roundRect) g.roundRect(i * step + (step - w) / 2, (canvas.height - h) / 2, w, h, 2);
+      else g.rect(i * step + (step - w) / 2, (canvas.height - h) / 2, w, h);
       g.fill();
     });
     const idle = performance.now() - voice.lastSound;
     // Never leave the microphone open on a silent room.
+    if (!voice.gotAudio && performance.now() - voice.started > 4000) { reportVoice("no-audio", voice.ctx ? voice.ctx.state : "no context"); cancelListening(); toast("The microphone isn't sending sound. Please try again."); return; }
     if (!voice.heard && performance.now() - voice.started > 12000) { cancelListening(); toast("I didn't hear anything."); return; }
     if (voice.heard && idle > 7000) { finishListening(false); return; }
     voice.raf = requestAnimationFrame(tick);
@@ -545,7 +572,7 @@ function drawMeter() {
 function releaseMic() {
   cancelAnimationFrame(voice.raf);
   voice.stream?.getTracks().forEach((t) => t.stop());
-  try { voice.node?.disconnect(); voice.source?.disconnect(); } catch { /* already gone */ }
+  try { if (voice.node) voice.node.onaudioprocess = null; voice.node?.disconnect(); voice.source?.disconnect(); } catch { /* already gone */ }
   voice.ctx?.close().catch(() => {});
   voice.stream = voice.node = voice.source = voice.ctx = null;
 }
@@ -567,6 +594,7 @@ function cancelListening() {
 // send=true: ✓ was tapped. send=false: stopped by itself; leave the words in the box.
 async function finishListening(send) {
   if (!voice.active || voice.finishing) return;
+  if (!voice.ready && !voice.recognition) return cancelListening();
   voice.finishing = true;
   if (voice.recognition) { voice.sendAfter = send; voice.recognition.stop(); return; }
   let text = "";

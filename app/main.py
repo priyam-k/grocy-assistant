@@ -400,6 +400,17 @@ async def listen(ws: WebSocket):
             pass
 
 
+class LogBody(BaseModel):
+    message: str
+
+
+@app.post("/api/log")
+async def client_log(body: LogBody, request: Request, user: User = Depends(current_user)):
+    """Problems the page hits on someone's phone (mostly voice), so they can be diagnosed."""
+    log.warning("client %s [%s]: %s", user.email, request.headers.get("user-agent", "")[:120], body.message[:300])
+    return {"ok": True}
+
+
 @app.get("/api/uploads/{name}")
 async def upload(name: str, user: User = Depends(current_user)):
     if not re.fullmatch(r"[0-9a-f]{32}\.(jpg|png|webp|gif)", name) or not (config.UPLOAD_DIR / name).exists():
