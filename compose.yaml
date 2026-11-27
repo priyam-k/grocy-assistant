@@ -1,0 +1,16 @@
+services:
+  grocy-assistant:
+    build: .
+    container_name: grocy-assistant
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=America/New_York
+      - GROCY_URL=http://host.docker.internal:9283
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./data:/data
+    ports:
+      # Only reachable from the VM itself; cloudflared (host network) forwards to it.
+      - 127.0.0.1:8484:8484
