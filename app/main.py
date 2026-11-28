@@ -28,7 +28,7 @@ from . import config
 from .agent import Agent, Emit
 from .db import DB, Conversation
 from .grocy import Catalog, Grocy, GrocyError, actor_email, actor_key
-from .tools import Toolbox
+from .tools import Toolbox, ToolError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -339,6 +339,47 @@ async def undo(body: UndoBody, user: User = Depends(current_user)):
     if failed and not undone:
         raise HTTPException(502, "Could not undo: " + "; ".join(failed))
     return {"card": card, "failed": failed}
+
+
+@app.get("/api/overview")
+async def overview(user: User = Depends(current_user)):
+    """What the home screen shows."""
+    try:
+        return {"widgets": await S.toolbox.overview()}
+    except GrocyError as e:
+        raise HTTPException(502, f"I can't reach Grocy right now ({e}).")
+
+
+@app.get("/api/widget")
+async def widget(kind: str, list_id: int | None = None, user: User = Depends(current_user)):
+    try:
+        return await S.toolbox.widget(kind, list_id)
+    except ToolError as e:
+        raise HTTPException(404, str(e))
+    except GrocyError as e:
+        raise HTTPException(502, f"I can't reach Grocy right now ({e}).")
+
+
+class TickBody(BaseModel):
+    kind: str
+    id: int
+    done: bool
+
+
+@app.post("/api/widget/tick")
+async def widget_tick(body: TickBody, user: User = Depends(current_user)):
+    """Ticking a row on a panel: a shopping list item, a task or a planned meal."""
+    act_as(user)
+    try:
+        act, result = await S.toolbox.tick(body.kind, body.id, body.done)
+    except ToolError as e:
+        raise HTTPException(409, str(e))
+    except GrocyError as e:
+        raise HTTPException(502, f"I can't reach Grocy right now ({e}).")
+    S.db.audit(user.email, None, act["title"], act["detail"], result)
+    if not result.get("ok"):
+        raise HTTPException(502, "That could not be saved.")
+    return {"ok": True}
 
 
 @app.post("/api/transcribe")

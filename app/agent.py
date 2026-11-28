@@ -256,7 +256,10 @@ class Agent:
             tool = BY_NAME[use["name"]]
             await emit({"type": "tool", "label": tool.label})
             try:
-                results[use["id"]] = result_block(use["id"], await self.toolbox.read(use["name"], use["input"] or {}))
+                data = await self.toolbox.read(use["name"], use["input"] or {})
+                if use["name"] == "show_widget":
+                    widgets[use["id"]] = data.pop("widgets")
+                results[use["id"]] = result_block(use["id"], data)
             except (ToolError, GrocyError) as e:
                 results[use["id"]] = result_block(use["id"], str(e), is_error=True)
             except Exception as e:
@@ -267,7 +270,11 @@ class Agent:
         for use in tool_uses:
             if use not in known:
                 results[use["id"]] = result_block(use["id"], f"Unknown tool or invalid input: {use['name']}", is_error=True)
+        widgets: dict[str, list[dict]] = {}
         await asyncio.gather(*(read(u) for u in known if BY_NAME[u["name"]].kind == "read"))
+        for use in known:  # panels appear in the order the model asked for them
+            for widget in widgets.get(use["id"], []):
+                await emit({"type": "item", "item": self.db.show(conv.id, {"t": "widget", **widget})})
 
         gated: list[dict] = []
         auto_rows: list[dict] = []

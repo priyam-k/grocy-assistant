@@ -86,7 +86,7 @@ svg { width: 22px; height: 22px; flex: none; fill: none; stroke: currentColor; s
   padding: calc(10px + env(safe-area-inset-top)) 10px calc(10px + env(safe-area-inset-bottom));
 }
 .side-top { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 12px 8px; }
-.brand { display: flex; align-items: center; gap: 10px; font-family: var(--serif); font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
+.brand { cursor: pointer; display: flex; align-items: center; gap: 10px; font-family: var(--serif); font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
 .brand img { border-radius: 7px; }
 #menu-close { display: none; }
 .side-row {
@@ -130,7 +130,7 @@ svg { width: 22px; height: 22px; flex: none; fill: none; stroke: currentColor; s
 /* ---------------------------------------------------------------- main */
 #app { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100%; }
 header { display: none; align-items: center; gap: 4px; padding: calc(6px + env(safe-area-inset-top)) 8px 6px; }
-header .title { flex: 1; font-family: var(--serif); font-size: 20px; font-weight: 600; }
+header .title { cursor: pointer; flex: 1; font-family: var(--serif); font-size: 20px; font-weight: 600; }
 header .avatar { margin-right: 6px; }
 
 main, #activity, footer { zoom: var(--zoom); }
@@ -209,6 +209,22 @@ label.row:hover, label.row:active { background: var(--surface-2); }
 .btn.link { flex: none; min-height: 40px; color: var(--muted); font-size: 15px; font-weight: 500; padding: 0 10px; border-radius: 8px; }
 .btn.link:hover { color: var(--ink); background: var(--surface-2); }
 .card-note { font-size: 15px; padding: 12px 16px; }
+
+/* ------------------------------------------------------------- widgets */
+.widget-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 13px 16px 2px; font-weight: 600; }
+.widget-head small { font-weight: 400; color: var(--muted); font-size: 14px; }
+.widget .rows { padding-top: 4px; }
+.widget .row { min-height: 44px; padding: 7px 10px; }
+.widget .row.done .row-title { text-decoration: line-through; color: var(--muted); font-weight: 400; }
+.widget .row.extra { display: none; }
+.widget .card-note { color: var(--muted); padding-top: 6px; }
+.widget .more { display: block; width: 100%; padding: 4px 16px 12px; color: var(--muted); font-size: 15px; text-align: left; }
+.widget .more:hover { color: var(--ink); }
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; margin: 0 8px; background: var(--muted); }
+.dot.bad { background: var(--danger); } .dot.warn, .dot.soon { background: var(--warn); } .dot.low { background: var(--accent); }
+.widget.loading { min-height: 76px; opacity: .6; }
+#home { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 12px; align-items: start; margin-top: 28px; }
+#home:empty { display: none; }
 
 .ask { display: flex; flex-wrap: wrap; gap: 8px; }
 .ask button { min-height: 44px; padding: 8px 16px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); font-weight: 500; }

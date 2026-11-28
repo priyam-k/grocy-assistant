@@ -236,7 +236,103 @@ function showAsk(item) {
   scrollDown(true);
 }
 
+// ------------------------------------------------------------------ widgets
+//
+// Live panels: a shopping list, tasks, the meal plan (rows can be ticked) or what needs
+// attention. The server sends {kind, title, items, empty}; ticking a row saves straight away.
+
+const TICKABLE = new Set(["shopping_list", "tasks", "meal_plan"]);
+
+function fillWidget(card, data) {
+  card.classList.remove("loading");
+  card.replaceChildren();
+  const tickable = TICKABLE.has(data.kind);
+  const head = el("div", "widget-head"), count = el("small");
+  const recount = () => {
+    const left = data.items.filter((i) => !i.done).length;
+    count.textContent = !data.items.length ? "" : tickable ? (left ? `${left} left` : "All done") : String(data.items.length);
+  };
+  head.append(el("span", null, data.title), count);
+  card.append(head);
+  recount();
+  if (!data.items.length) { card.append(el("div", "card-note", data.empty)); return; }
+  const rows = el("ul", "rows");
+  data.items.forEach((it, i) => {
+    const row = el(tickable ? "label" : "li", `row${it.done ? " done" : ""}${i >= 8 && !card.expanded ? " extra" : ""}`);
+    if (tickable) {
+      const box = el("input");
+      box.type = "checkbox"; box.checked = !!it.done;
+      box.addEventListener("change", async () => {
+        it.done = box.checked; row.classList.toggle("done", it.done); recount(); buzz();
+        try {
+          const r = await fetch("/api/widget/tick", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: data.kind, id: it.id, done: it.done }) });
+          if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail);
+        } catch (err) {
+          it.done = box.checked = !it.done; row.classList.toggle("done", it.done); recount();
+          toast(err.message || "That didn't save. Please try again.");
+        }
+      });
+      row.append(box);
+    } else {
+      row.append(el("span", `dot ${it.tone || ""}`));
+    }
+    const text = el("div", "row-text");
+    text.append(el("div", "row-title", it.name));
+    if (it.detail) text.append(el("div", "row-detail", it.detail));
+    row.append(text);
+    rows.append(row);
+  });
+  card.append(rows);
+  if (data.items.length > 8 && !card.expanded) {
+    const more = el("button", "more", `Show ${data.items.length - 8} more`);
+    more.type = "button";
+    more.addEventListener("click", () => { card.expanded = true; fillWidget(card, data); });
+    card.append(more);
+  }
+}
+
+async function loadWidget(card) {
+  try {
+    const r = await fetch(`/api/widget?kind=${card.dataset.kind}${card.dataset.list ? `&list_id=${card.dataset.list}` : ""}`);
+    if (!r.ok) throw new Error();
+    fillWidget(card, await r.json());
+  } catch {
+    if (card.classList.contains("loading")) { card.classList.remove("loading"); card.replaceChildren(el("div", "card-note", "I couldn't load this just now.")); }
+  }
+}
+
+function showWidget(item) {
+  hideWelcome();
+  const card = el("div", "card widget loading");
+  card.dataset.kind = item.kind;
+  if (item.list_id) card.dataset.list = item.list_id;
+  thread.append(card);
+  loadWidget(card).then(() => scrollDown());
+  scrollDown();
+}
+
+// Panels in the chat show live data, so bring them up to date after anything changes.
+function refreshWidgets() {
+  thread.querySelectorAll(":scope > .widget").forEach(loadWidget);
+}
+
+// Home screen: the overview panels under the greeting.
+async function loadHome() {
+  if ($("welcome").hidden) return;
+  try {
+    const r = await fetch("/api/overview");
+    if (!r.ok) throw new Error();
+    const cards = (await r.json()).widgets.map((data) => {
+      const card = el("div", "card widget");
+      fillWidget(card, data);
+      return card;
+    });
+    $("home").replaceChildren(...cards);
+  } catch { /* the overview is a convenience; the chat still works without it */ }
+}
+
 function showItem(item) {
+  if (item.t === "widget") return showWidget(item);
   if (item.t === "user") showUser(item);
   else if (item.t === "assistant") showAssistant(item.text);
   else if (item.t === "card") showCard(item);
@@ -360,6 +456,7 @@ async function run(request, onFail) {
     setActivity(null);
     refreshComposer();
     refreshHistory();
+    refreshWidgets();
     afterTurn();
   }
 }
@@ -1052,6 +1149,7 @@ async function deleteChat(chat) {
     state.conversation = null;
     clearThread();
     $("welcome").hidden = false;
+    loadHome();
   }
   renderHistory(state.history);
   toast("Chat deleted.");
@@ -1126,12 +1224,16 @@ function newChat() {
   state.conversation = null;
   clearThread();
   $("welcome").hidden = false;
-  scrollDown(true);
+  thread.scrollTop = 0;
+  state.atBottom = true; $("jump").hidden = true;
   renderHistory(state.history);
+  loadHome();
   if (!phone.matches) input.focus();
 }
 $("new-chat").addEventListener("click", newChat);
 $("new-top").addEventListener("click", newChat);
+$("home-link").addEventListener("click", newChat);  // the Pantry name and icon lead home
+$("home-top").addEventListener("click", newChat);
 document.querySelector(".quick").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (!b) return;
@@ -1159,6 +1261,7 @@ async function boot() {
     if (data.conversation && data.conversation.items.length) renderConversation(data.conversation);
     renderHistory(data.history || []);
     if (data.conversation && data.conversation.busy) catchUp();
+    loadHome();
   } catch {
     showError("I couldn't load.", RELOAD);
   }
@@ -1178,7 +1281,7 @@ document.addEventListener("visibilitychange", async () => {
   if (state.busy || away < 5 * 60e3) return;
   if (away > 6 * 3600e3 && !input.value.trim() && !state.images.length) { location.reload(); return; }
   refreshHistory();
-  if (state.conversation) catchUp();
+  if (state.conversation) catchUp(); else loadHome();
 });
 window.addEventListener("online", () => { if (state.conversation && thread.querySelector(".msg.error")) { thread.querySelectorAll(".msg.error").forEach((n) => n.remove()); catchUp(); } });
 window.addEventListener("offline", () => toast("You're offline. I'll be here when the internet is back.", 5000));

@@ -53,6 +53,10 @@ hidden or the phone is locked.
   box.
 - On phones the menu follows a sideways swipe on the chat. "Sign out" (two taps) goes to
   Cloudflare Access's `/cdn-cgi/access/logout` and only shows for people who came in through Access.
+- **Widgets.** `Toolbox.widget()` builds live panels (a shopping list, tasks, what needs attention,
+  the meal plan). The model puts one in the chat with the `show_widget` tool; the home screen
+  (`/api/overview`, reached by clicking the Pantry name) shows the same panels. Ticking a row calls
+  `/api/widget/tick`, which reuses the tools' plan and execute steps and is written to the audit log.
 - Chats can be renamed and deleted from the ⋯ button in the menu (`PATCH` / `DELETE
   /api/conversations/{id}`). Deleting removes the chat and its photos; the audit log is kept.
 - Appearance (theme, background tone, accent colour, text size) is stored per device in

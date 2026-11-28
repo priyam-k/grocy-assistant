@@ -625,6 +625,17 @@ TOOLS: list[Tool] = [
         "FEATURE_FLAG_BATTERIES",
     ),
     Tool(
+        "show_widget",
+        "Show a live panel in the chat that the user can read and tick things off on: a shopping list "
+        "(tick items as bought), the to-do tasks (tick to complete), what needs attention (expired, "
+        "due soon, running low) or the meal plan. Use it whenever the user asks to see one of these, "
+        "instead of writing the items out. The result tells you what the panel shows; do not repeat "
+        "the items in your reply, add at most a short remark.",
+        obj({"kind": {"type": "string", "enum": ["shopping_list", "tasks", "attention", "meal_plan"]},
+             "list_id": d(INT, "Shopping lists only. Omit to show every list that has items.")}, ["kind"]),
+        "Putting it on screen",
+    ),
+    Tool(
         "ask_user",
         "Ask the user one short question with 2 to 5 tappable answers, e.g. to pick between similar "
         "products or to offer adding something to the shopping list. They can also answer in their own "
@@ -1178,6 +1189,102 @@ class Toolbox:
             out["battery_charges"] = [{"day": str(b["next_estimated_charge_time"])[:10], "name": (b.get("battery") or {}).get("name")}
                                       for b in await self.g.get("/batteries") if inside(b.get("next_estimated_charge_time"))]
         return out
+
+    # ------------------------------------------------------------ widgets
+    #
+    # Panels the page draws from live data: in the chat (show_widget) and on the home screen.
+
+    async def widget(self, kind: str, list_id: Any = None) -> dict:
+        await self.cat.refresh()
+        if kind == "shopping_list":
+            lid = to_int(list_id) or min(self.cat.lists, default=1)
+            if self.cat.lists and lid not in self.cat.lists:
+                raise ToolError(f"There is no shopping list with id {list_id}.")
+            items = []
+            for r in await self.g.objects("shopping_list", [f"shopping_list_id={lid}"]):
+                pid = to_int(r.get("product_id"))
+                amount = self.cat.amount(pid, r["amount"]) if pid else (fmt_num(r["amount"]) if to_float(r["amount"]) != 1 else "")
+                detail = " · ".join(x for x in (amount, r.get("note") if pid else "") if x)
+                items.append({"id": to_int(r["id"]), "name": self.cat.product_name(pid) if pid else (r.get("note") or "(empty)"), "detail": detail, "done": bool(to_int(r.get("done")))})
+            return {"kind": kind, "list_id": lid, "title": self.cat.lists.get(lid, {}).get("name") or "Shopping list", "items": items, "empty": "Nothing on this list."}
+        if kind == "tasks":
+            if not self.cat.feature("FEATURE_FLAG_TASKS"):
+                raise ToolError("Tasks are switched off in this Grocy.")
+            users, today = await self.users(), self.today().isoformat()
+            tasks = sorted(await self.g.get("/tasks"), key=lambda t: str(t.get("due_date") or "9999"))
+            items = []
+            for t in tasks:
+                due = str(t.get("due_date") or "")[:10]
+                who = users.get(to_int(t.get("assigned_to_user_id")) or -1)
+                detail = " · ".join(x for x in ((("Was due " if due < today else "Due ") + nice_date(due)) if due else "", who or "") if x)
+                items.append({"id": to_int(t["id"]), "name": t["name"], "detail": detail, "done": False, "tone": "bad" if due and due < today else ""})
+            return {"kind": kind, "title": "To do", "items": items, "empty": "Nothing to do."}
+        if kind == "attention":
+            v = await self.g.get("/stock/volatile", due_soon_days=5)
+            items = []
+            for key, tone, word in (("expired_products", "bad", "Expired"), ("overdue_products", "warn", "Best before"), ("due_products", "soon", "Use by")):
+                for r in v.get(key) or []:
+                    items.append({"name": self.cat.product_name(r["product_id"]), "tone": tone,
+                                  "detail": f"{word} {nice_date(r.get('best_before_date'))} · {self.cat.amount(r['product_id'], r['amount'])}"})
+            for m in v.get("missing_products") or []:
+                items.append({"name": m["name"], "tone": "low", "detail": f"Running low · {self.cat.amount(m['id'], m['amount_missing'])} short"})
+            return {"kind": kind, "title": "Needs attention", "items": items, "empty": "Nothing is going off or running low."}
+        if kind == "meal_plan":
+            if not (self.cat.feature("FEATURE_FLAG_RECIPES") and self.cat.feature("FEATURE_FLAG_RECIPES_MEALPLAN")):
+                raise ToolError("The meal plan is switched off in this Grocy.")
+            start, end = self.today(), self.today() + timedelta(days=6)
+            sections = await self.sections()
+            items = []
+            for r in await self.g.objects("meal_plan", [f"day>={start.isoformat()}", f"day<={end.isoformat()}"], order="day"):
+                day = date.fromisoformat(r["day"][:10])
+                when = "Today" if day == start else "Tomorrow" if day == start + timedelta(days=1) else day.strftime("%A")
+                detail = " · ".join(x for x in (when, sections.get(to_int(r.get("section_id")) or -1, "")) if x)
+                items.append({"id": to_int(r["id"]), "name": await self.meal_title(r), "detail": detail, "done": bool(to_int(r.get("done")))})
+            return {"kind": kind, "title": "Meal plan", "items": items, "empty": "Nothing is planned this week."}
+        raise ToolError("Unknown widget kind.")
+
+    async def overview(self) -> list[dict]:
+        """The home screen: what needs attention, the shopping lists, tasks and the week's meals."""
+        await self.cat.refresh()
+        out = []
+        attention = await self.widget("attention")
+        if attention["items"]:
+            out.append(attention)
+        lists = [await self.widget("shopping_list", lid) for lid in sorted(self.cat.lists)]
+        out += [w for w in lists if w["items"]] or lists[:1]
+        for kind in ("tasks", "meal_plan"):
+            try:
+                extra = await self.widget(kind)
+            except ToolError:
+                continue
+            if extra["items"]:
+                out.append(extra)
+        return out
+
+    async def tick(self, kind: str, row_id: int, done: bool) -> tuple[dict, dict]:
+        """A tick on a widget. Uses the same plan and execute steps as the tools."""
+        name, inp = {
+            "shopping_list": ("update_shopping_list_item", {"item_id": row_id, "done": done}),
+            "tasks": ("complete_task" if done else "reopen_task", {"task_id": row_id}),
+            "meal_plan": ("update_meal_plan_entry", {"entry_id": row_id, "done": done}),
+        }.get(kind, (None, None))
+        if not name:
+            raise ToolError("That cannot be ticked.")
+        act = (await self.plan(name, inp))[0]
+        return act, await self.execute(act)
+
+    async def r_show_widget(self, inp: dict) -> Any:
+        kind = str(inp.get("kind"))
+        if kind == "shopping_list" and not inp.get("list_id"):
+            every = [await self.widget(kind, lid) for lid in sorted(self.cat.lists)]
+            widgets = [w for w in every if w["items"]] or every[:1]
+        else:
+            widgets = [await self.widget(kind, inp.get("list_id"))]
+        return {
+            "now_on_screen": [{"title": w["title"], "items": [f"{i['name']} ({i['detail']})" if i.get("detail") else i["name"] for i in w["items"]] or w["empty"]} for w in widgets],
+            "note": "The user sees this as a panel and can tick items themselves. Do not list the items again.",
+            "widgets": [{"kind": w["kind"], **({"list_id": w["list_id"]} if "list_id" in w else {})} for w in widgets],
+        }
 
     async def r_get_spending(self, inp: dict) -> Any:
         end = parse_date(inp.get("to_date"), "to_date") or self.today().isoformat()
