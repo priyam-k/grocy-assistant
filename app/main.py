@@ -222,6 +222,34 @@ async def conversation(conversation_id: str, user: User = Depends(current_user))
     return {"id": conv.id, "items": S.db.shown(conv.id), "busy": is_busy(conv.id)}
 
 
+class RenameBody(BaseModel):
+    title: str
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def rename_conversation(conversation_id: str, body: RenameBody, user: User = Depends(current_user)):
+    title = " ".join(body.title.split())[:80]
+    if not title:
+        raise HTTPException(400, "The name can't be empty.")
+    if not S.db.rename(conversation_id, user.email, title):
+        raise HTTPException(404, "That chat no longer exists.")
+    return {"id": conversation_id, "title": title}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, user: User = Depends(current_user)):
+    if is_busy(conversation_id):
+        raise HTTPException(409, "I'm still working in that chat. Try again in a moment.")
+    photos = [name for item in S.db.shown(conversation_id) for name in item.get("images") or []] if S.db.get(conversation_id, user.email) else []
+    if not S.db.delete(conversation_id, user.email):
+        raise HTTPException(404, "That chat no longer exists.")
+    for name in photos:
+        if re.fullmatch(r"[0-9a-f]{32}\.(jpg|png|webp|gif)", name):
+            (config.UPLOAD_DIR / name).unlink(missing_ok=True)
+    S.locks.pop(conversation_id, None)
+    return {"ok": True}
+
+
 @app.post("/api/chat")
 async def chat(
     text: str = Form(""),

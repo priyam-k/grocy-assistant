@@ -53,6 +53,11 @@ hidden or the phone is locked.
   box.
 - On phones the menu follows a sideways swipe on the chat. "Sign out" (two taps) goes to
   Cloudflare Access's `/cdn-cgi/access/logout` and only shows for people who came in through Access.
+- Chats can be renamed and deleted from the ⋯ button in the menu (`PATCH` / `DELETE
+  /api/conversations/{id}`). Deleting removes the chat and its photos; the audit log is kept.
+- Appearance (theme, background tone, accent colour, text size) is stored per device in
+  `localStorage` and applied as `data-*` attributes on `<html>`; all colours are CSS variables in
+  `app.css`.
 - The page is sized to `visualViewport` so the message box sits on top of the iOS keyboard.
 
 Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `yourteam.cloudflareaccess.com`) and `CF_ACCESS_AUD` (the

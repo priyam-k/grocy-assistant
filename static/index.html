@@ -3,8 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta name="theme-color" content="#faf9f5" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#262624" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#faf9f5">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Pantry">
 <title>Pantry</title>
@@ -12,6 +11,17 @@
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/static/icon.svg">
 <link rel="stylesheet" href="/static/app.css">
+<script>
+// Apply the saved look before the page paints, so there is no flash of the wrong colours.
+// (Wrapped in a function so its names don't collide with app.js.)
+(function () { try {
+  var look = JSON.parse(localStorage.getItem("look") || "{}"), root = document.documentElement;
+  root.dataset.theme = look.theme === "light" || look.theme === "dark" ? look.theme : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  root.dataset.tone = look.tone || "warm";
+  root.dataset.accent = look.accent || "green";
+  root.dataset.size = look.size || "normal";
+} catch (e) {} })();
+</script>
 </head>
 <body>
 <div id="scrim"></div>
@@ -28,6 +38,9 @@
   </button>
   <nav id="history" aria-label="Past chats"></nav>
   <div class="side-foot">
+    <button id="look-open" class="side-row" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.2 0 1.8-.9 1.8-1.8 0-1.3-.9-1.6-.9-2.7 0-1 .8-1.7 1.8-1.7h2a3.8 3.8 0 0 0 3.8-3.8c0-3.900-3.800-7-8.500-7z"/><circle cx="8" cy="11" r=".6"/><circle cx="11" cy="7.500" r=".6"/><circle cx="15.500" cy="8.500" r=".6"/></svg>Appearance
+    </button>
     <button id="speak-toggle" class="side-row" type="button" role="switch" aria-checked="false">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4zM15.5 9a4.5 4.5 0 0 1 0 6M18 6.5a8 8 0 0 1 0 11"/></svg>
       <span>Read replies aloud</span><i class="switch"></i>
@@ -105,6 +118,19 @@
     <input id="file" type="file" accept="image/*" multiple hidden>
   </footer>
 </div>
+<dialog id="look" aria-labelledby="look-title">
+  <div class="look-head">
+    <h2 id="look-title">Appearance</h2>
+    <button id="look-close" class="icon-btn" type="button" aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="look-label">Theme</div><div class="seg" data-pref="theme"></div>
+  <div class="look-label">Background</div><div class="seg" data-pref="tone"></div>
+  <div class="look-label">Colour</div><div class="swatches" data-pref="accent"></div>
+  <div class="look-label">Text size</div><div class="seg" data-pref="size"></div>
+  <p class="look-note">Saved on this device.</p>
+</dialog>
 <div id="lightbox" hidden><img alt="Photo"></div>
 <div id="toast" role="status" hidden></div>
 <script src="/static/app.js" defer></script>

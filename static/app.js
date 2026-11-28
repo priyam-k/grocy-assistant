@@ -907,7 +907,7 @@ scrim.addEventListener("click", () => setMenu(false));
 let drag = null;
 document.addEventListener("touchstart", (e) => {
   drag = null;
-  if (!phone.matches || e.touches.length !== 1 || voice.active || !$("lightbox").hidden) return;
+  if (!phone.matches || e.touches.length !== 1 || voice.active || !$("lightbox").hidden || $("look").open) return;
   const open = document.body.classList.contains("menu-open");
   if (!open && e.target.closest("#composer, #previews")) return;
   const t = e.touches[0];
@@ -971,6 +971,8 @@ function dayLabel(seconds) {
   return days <= 0 ? "Today" : days === 1 ? "Yesterday" : days < 7 ? "Earlier this week" : "Older";
 }
 
+const DOTS = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="18.5" cy="12" r="1.2"/></svg>';
+
 function renderHistory(list) {
   const nav = $("history");
   nav.replaceChildren();
@@ -979,14 +981,122 @@ function renderHistory(list) {
   for (const chat of list) {
     const label = dayLabel(chat.updated_at);
     if (label !== group) { nav.append(el("div", "side-label", label)); group = label; }
-    const b = el("button", chat.id === state.conversation ? "active" : null, chat.title);
-    b.type = "button";
-    b.title = new Date(chat.updated_at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-    b.addEventListener("click", () => openConversation(chat.id));
-    nav.append(b);
+    const row = el("div", "chat-row" + (chat.id === state.conversation ? " active" : ""));
+    const open = el("button", "chat-open", chat.title), more = el("button", "chat-more");
+    open.type = more.type = "button";
+    open.title = new Date(chat.updated_at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    open.addEventListener("click", () => openConversation(chat.id));
+    more.innerHTML = DOTS;
+    more.setAttribute("aria-label", `Rename or delete "${chat.title}"`);
+    more.addEventListener("click", () => toggleChatActions(row, chat));
+    row.append(open, more);
+    nav.append(row);
   }
   state.history = list;
 }
+
+// The ⋯ button opens a small strip under the chat with Rename and Delete.
+function toggleChatActions(row, chat) {
+  const wasOpen = row.classList.contains("open");
+  $("history").querySelectorAll(".chat-actions").forEach((n) => n.remove());
+  $("history").querySelectorAll(".chat-row.open").forEach((n) => n.classList.remove("open"));
+  if (wasOpen) return;
+  row.classList.add("open");
+  const strip = el("div", "chat-actions"), rename = el("button", null, "Rename"), remove = el("button", "danger", "Delete");
+  rename.type = remove.type = "button";
+  rename.addEventListener("click", () => { strip.remove(); row.classList.remove("open"); renameChat(row, chat); });
+  remove.addEventListener("click", () => {
+    // Two taps, so a chat is never lost to a stray touch.
+    if (!remove.classList.contains("armed")) { remove.classList.add("armed"); remove.textContent = "Tap again to delete"; return; }
+    deleteChat(chat);
+  });
+  strip.append(rename, remove);
+  row.after(strip);
+}
+
+function renameChat(row, chat) {
+  const field = el("input", "chat-rename");
+  field.value = chat.title; field.maxLength = 80; field.setAttribute("aria-label", "Chat name");
+  field.enterKeyHint = "done";
+  row.querySelector(".chat-open").replaceWith(field);
+  row.querySelector(".chat-more").hidden = true;
+  field.focus(); field.select();
+  let finished = false;
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+    const title = field.value.trim();
+    if (save && title && title !== chat.title) {
+      try {
+        const r = await fetch(`/api/conversations/${chat.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail);
+        chat.title = (await r.json()).title;
+      } catch (err) { toast(err.message || "I couldn't rename that chat."); }
+    }
+    renderHistory(state.history);
+  };
+  field.addEventListener("keydown", (e) => {
+    e.stopPropagation();  // Escape here cancels the rename, not the whole menu
+    if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false);
+  });
+  field.addEventListener("blur", () => finish(true));
+}
+
+async function deleteChat(chat) {
+  try {
+    const r = await fetch(`/api/conversations/${chat.id}`, { method: "DELETE" });
+    if (!r.ok && r.status !== 404) throw new Error((await r.json().catch(() => ({}))).detail);
+  } catch (err) { toast(err.message || "I couldn't delete that chat."); return; }
+  state.history = state.history.filter((c) => c.id !== chat.id);
+  if (chat.id === state.conversation && !state.busy) {
+    state.conversation = null;
+    clearThread();
+    $("welcome").hidden = false;
+  }
+  renderHistory(state.history);
+  toast("Chat deleted.");
+}
+
+// ---------------------------------------------------------------- appearance
+
+const LOOK = {
+  theme: [["system", "Auto"], ["light", "Light"], ["dark", "Dark"]],
+  tone: [["warm", "Warm"], ["cool", "Cool"]],
+  accent: [["green", "Green"], ["teal", "Teal"], ["blue", "Blue"], ["purple", "Purple"], ["rose", "Rose"], ["clay", "Clay"], ["amber", "Amber"]],
+  size: [["normal", "Normal"], ["large", "Large"], ["xlarge", "Largest"]],
+};
+const look = { theme: "system", tone: "warm", accent: "green", size: "normal" };
+try { Object.assign(look, JSON.parse(localStorage.getItem("look") || "{}")); } catch { /* keep the defaults */ }
+const systemDark = matchMedia("(prefers-color-scheme: dark)");
+
+function applyLook() {
+  for (const key of Object.keys(LOOK)) if (!LOOK[key].some(([value]) => value === look[key])) look[key] = LOOK[key][0][0];
+  const root = document.documentElement;
+  root.dataset.theme = look.theme === "system" ? (systemDark.matches ? "dark" : "light") : look.theme;
+  root.dataset.tone = look.tone; root.dataset.accent = look.accent; root.dataset.size = look.size;
+  document.querySelector('meta[name="theme-color"]').content = getComputedStyle(root).getPropertyValue("--bg").trim();
+  document.querySelectorAll("#look [data-pref] button").forEach((b) => b.setAttribute("aria-pressed", look[b.parentElement.dataset.pref] === b.value));
+}
+systemDark.addEventListener("change", applyLook);
+
+document.querySelectorAll("#look [data-pref]").forEach((group) => {
+  const key = group.dataset.pref;
+  for (const [value, label] of LOOK[key]) {
+    const b = el("button", null, key === "accent" ? "" : label);
+    b.type = "button"; b.value = value;
+    if (key === "accent") { b.dataset.accent = value; b.setAttribute("aria-label", label); b.title = label; }
+    b.addEventListener("click", () => {
+      look[key] = value;
+      try { localStorage.setItem("look", JSON.stringify(look)); } catch { /* private mode: lasts until reload */ }
+      applyLook();
+    });
+    group.append(b);
+  }
+});
+applyLook();
+$("look-open").addEventListener("click", () => { setMenu(false); $("look").showModal(); });
+$("look-close").addEventListener("click", () => $("look").close());
+$("look").addEventListener("click", (e) => { if (e.target === $("look")) $("look").close(); });  // tap outside
 
 async function refreshHistory() {
   try {

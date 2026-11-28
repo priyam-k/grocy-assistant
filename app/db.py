@@ -134,6 +134,16 @@ class DB:
     def set_title(self, conversation_id: str, title: str) -> None:
         self.conn.execute("UPDATE conversations SET title=? WHERE id=? AND title IS NULL", (title, conversation_id))
 
+    def rename(self, conversation_id: str, user: str, title: str) -> bool:
+        return self.conn.execute("UPDATE conversations SET title=? WHERE id=? AND user=?", (title, conversation_id, user)).rowcount > 0
+
+    def delete(self, conversation_id: str, user: str) -> bool:
+        """Remove a chat and what it showed. The audit log of changes made in Grocy is kept."""
+        gone = self.conn.execute("DELETE FROM conversations WHERE id=? AND user=?", (conversation_id, user)).rowcount > 0
+        if gone:
+            self.conn.execute("DELETE FROM display WHERE conversation_id=?", (conversation_id,))
+        return gone
+
     def history(self, user: str, limit: int = 60) -> list[dict]:
         rows = self.conn.execute(
             "SELECT id, title, updated_at FROM conversations WHERE user=? AND title IS NOT NULL "
